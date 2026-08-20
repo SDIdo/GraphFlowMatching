@@ -246,6 +246,28 @@ existing copy: `find / -maxdepth 4 -type d -name n01440764 2>/dev/null | head`
 checks the path is readable before doing anything expensive. CIFAR-10 needs
 none of this -- it downloads itself.
 
+**ImageNet as parquet shards.** If `DATA_ROOT_IMAGENET` holds HuggingFace
+parquet shards (`data/train-00000-of-00294.parquet`, ...) instead of a JPEG
+folder tree, that is detected automatically -- no conversion needed. Check what
+you have first:
+
+```bash
+python datasets/inspect_parquet.py --root /path/to/ImageNet/data
+```
+
+The decisive question it answers is whether the shards kept the **original
+filenames**. ImageNet-LT selects ~115k specific images by name, so:
+
+- filenames present -> the official split is matched onto parquet rows exactly;
+- filenames absent -> only a Pareto reconstruction from the labels is possible,
+  which reproduces the long-tailed profile but not the official image list, and
+  is reported as `pareto_reconstruction_parquet` in the metadata. Pass
+  `--no_pareto_fallback` to refuse it instead.
+
+Indexing reads only the label and filename columns, never the image bytes
+(~0.5% of the data), so scanning 294 shards costs seconds. Batches are kept
+inside one parquet row group so decoding stays sequential.
+
 **ImageNet-LT split file.** `DATA_ROOT_IMAGENET` is the *image* root; the split
 `.txt` files are a separate thing, listing paths like
 `train/n01440764/n01440764_190.JPEG` relative to that image root. The job

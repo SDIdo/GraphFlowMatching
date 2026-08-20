@@ -99,7 +99,10 @@ def main(argv=None):
 
     n = min(args.num_images, len(ds))
     rng = np.random.RandomState(args.seed)
-    idx = rng.permutation(len(ds))[:n].tolist()
+    # Sorted, not shuffled: the sample is a bag of images, so order is
+    # irrelevant, but reading it in index order keeps a parquet-backed dataset
+    # inside one row group at a time instead of thrashing its decode cache.
+    idx = sorted(rng.permutation(len(ds))[:n].tolist())
     ds = Subset(ds, idx)
 
     loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False,

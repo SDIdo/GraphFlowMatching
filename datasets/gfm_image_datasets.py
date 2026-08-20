@@ -107,8 +107,11 @@ def check_dataset_root(root, what="ImageNet", env_var="DATA_ROOT_IMAGENET"):
     hint = (f"\nSet the location explicitly, e.g.\n"
             f"    {env_var}=/path/to/imagenet sbatch sbatch/run_gfm.sbatch ...\n"
             f"or pass --data_root /path/to/imagenet directly.\n"
-            f"The directory must contain the wnid folders, either directly or "
-            f"under train/ (train/n01440764/..., train/n01443537/, ...).\n")
+            f"The directory must hold either\n"
+            f"  (a) the wnid folders -- directly or under train/ "
+            f"(train/n01440764/, ...), or\n"
+            f"  (b) HuggingFace parquet shards -- *.parquet, directly or under\n"
+            f"      data/ (data/train-00000-of-00294.parquet, ...).\n")
     if not root.exists():
         raise SystemExit(f"\n[data error] {what} root does not exist: {root}{hint}")
     if not root.is_dir():
@@ -457,6 +460,100 @@ def shot_groups(class_counts, many_thr=100, few_thr=20):
     return {"many": sorted(many), "medium": sorted(medium), "few": sorted(few)}
 
 
+def build_imagenet_lt_parquet(root_dir, split="train", image_size=256,
+                              use_horizontal_flips=True, return_label=True,
+                              split_file=None, split_dir=None,
+                              allow_pareto_fallback=True, pareto_seed=0):
+    """ImageNet-LT on top of parquet shards.
+
+    Prefers the official split, matched onto parquet rows by filename. That is
+    only possible if the shards kept the original filenames; when they did not,
+    falls back to reconstructing the long-tailed profile from the labels, which
+    is *not* the official split and is reported as such.
+    """
+    from datasets.imagenet_parquet import (build_index, find_parquet_shards,
+                                           ImageNetParquetDataset,
+                                           match_split_to_rows)
+
+    shards = find_parquet_shards(root_dir, "train")
+    print(f"[data] ImageNet-LT from {len(shards)} parquet shard(s); indexing "
+          f"(image bytes are not read)")
+    rows, image_col, _, name_leaf = build_index(shards, want_names=True)
+    print(f"[data] {len(rows):,} rows indexed; "
+          f"filenames {'present' if name_leaf else 'ABSENT'}")
+
+    if split_file is None:
+        split_file = download_lt_split(split, split_dir or default_split_dir())
+
+    have_names = bool(name_leaf) and any(r[4] for r in rows[:1000])
+    source = None
+    selected = None
+
+    if split_file and os.path.exists(split_file) and have_names:
+        samples = read_lt_split_file(split_file)
+        selected, missing = match_split_to_rows(rows, samples)
+        frac = missing / max(1, len(samples))
+        if frac > 0.02:
+            raise SystemExit(
+                f"\n[data error] only {len(selected):,}/{len(samples):,} "
+                f"ImageNet-LT entries matched rows in the parquet shards "
+                f"({frac:.1%} missing).\n"
+                f"The filenames in the shards probably do not correspond to the "
+                f"original ImageNet ones.\n"
+                f"Inspect them with:\n"
+                f"    python datasets/inspect_parquet.py --root {root_dir}\n")
+        source = f"official:{os.path.basename(split_file)}+parquet"
+    elif not have_names:
+        if not allow_pareto_fallback:
+            raise SystemExit(
+                "\n[data error] the parquet shards carry no original filenames, "
+                "so the official ImageNet-LT split cannot be matched, and "
+                "--no_pareto_fallback forbids reconstructing one.\n"
+                "Either use a JPEG-folder ImageNet, or drop "
+                "--no_pareto_fallback and accept a reconstructed split.\n")
+        print("[ImageNet-LT] parquet shards carry no filenames -> "
+              "reconstructing a Pareto(alpha=6) split from the labels. "
+              "This is NOT the official split.")
+        idx_label = [(i, r[3]) for i, r in enumerate(rows)]
+        picked, _ = build_lt_split_pareto(idx_label, seed=pareto_seed)
+        selected = [rows[int(i)] for i, _ in picked]
+        source = f"pareto_reconstruction_parquet(seed={pareto_seed})"
+    else:
+        if not allow_pareto_fallback:
+            raise SystemExit(
+                "\n[data error] no ImageNet-LT split file available and "
+                "--no_pareto_fallback was passed.\n")
+        print("[ImageNet-LT] no split file -> Pareto reconstruction from labels.")
+        idx_label = [(i, r[3]) for i, r in enumerate(rows)]
+        picked, _ = build_lt_split_pareto(idx_label, seed=pareto_seed)
+        selected = [rows[int(i)] for i, _ in picked]
+        source = f"pareto_reconstruction_parquet(seed={pareto_seed})"
+
+    ds = ImageNetParquetDataset(
+        shards, selected, image_col, image_size=image_size,
+        use_horizontal_flips=use_horizontal_flips, return_label=return_label)
+    ds.split_source = source
+
+    counts = ds.class_counts()
+    vals = sorted(counts.values(), reverse=True)
+    report = {"num_images": len(selected), "num_classes": len(counts),
+              "max_per_class": vals[0] if vals else 0,
+              "min_per_class": vals[-1] if vals else 0,
+              "imbalance_ratio": (vals[0] / vals[-1]) if vals and vals[-1] else float("inf"),
+              "split_source": source}
+    ds.imbalance_report = lambda: report
+    if source.startswith("official"):
+        got = {k: report[k] for k in LT_TRAIN_EXPECTED}
+        if got == LT_TRAIN_EXPECTED:
+            print(f"[ImageNet-LT] official split verified: {got}")
+        else:
+            print(f"[ImageNet-LT] WARNING: statistics {got} differ from the "
+                  f"published {LT_TRAIN_EXPECTED}")
+    else:
+        print(f"[ImageNet-LT] reconstructed split: {report}")
+    return ds
+
+
 def build_image_dataset(name, root_dir, split="train", image_size=256,
                         use_horizontal_flips=False, return_label=True,
                         **kwargs):
@@ -469,6 +566,19 @@ def build_image_dataset(name, root_dir, split="train", image_size=256,
                               download=kwargs.get("download", True))
     if name in ("imagenet", "imnet", "imagenet-1k"):
         check_dataset_root(root_dir, "ImageNet", "DATA_ROOT_IMAGENET")
+        from datasets.imagenet_parquet import (build_index, find_parquet_shards,
+                                               ImageNetParquetDataset,
+                                               is_parquet_dir)
+        if is_parquet_dir(root_dir):
+            shards = find_parquet_shards(root_dir, split)
+            print(f"[data] ImageNet as {len(shards)} parquet shard(s); "
+                  f"indexing labels (image bytes are not read)")
+            rows, image_col, _, _ = build_index(shards, want_names=False)
+            print(f"[data] {len(rows):,} rows")
+            return ImageNetParquetDataset(
+                shards, rows, image_col, image_size=image_size,
+                use_horizontal_flips=use_horizontal_flips,
+                return_label=return_label)
         sub = kwargs.get("imagenet_subdir", split)
         root = os.path.join(root_dir, sub) if sub else root_dir
         # Tolerate being pointed straight at the wnid folders instead of at the
@@ -481,6 +591,17 @@ def build_image_dataset(name, root_dir, split="train", image_size=256,
                                use_horizontal_flips=use_horizontal_flips,
                                return_label=return_label)
     if name in ("imagenet-lt", "imagenet_lt", "imnet-lt"):
+        check_dataset_root(root_dir, "ImageNet-LT", "DATA_ROOT_IMAGENET")
+        from datasets.imagenet_parquet import is_parquet_dir
+        if is_parquet_dir(root_dir):
+            return build_imagenet_lt_parquet(
+                root_dir, split=split, image_size=image_size,
+                use_horizontal_flips=use_horizontal_flips,
+                return_label=return_label,
+                split_file=kwargs.get("split_file"),
+                split_dir=kwargs.get("split_dir"),
+                allow_pareto_fallback=kwargs.get("allow_pareto_fallback", True),
+                pareto_seed=kwargs.get("pareto_seed", 0))
         return ImageNetLTDataset(
             root_dir, split=split, image_size=image_size,
             use_horizontal_flips=use_horizontal_flips,

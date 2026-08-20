@@ -248,7 +248,7 @@ python - <<'PY' || exit 1
 import importlib.util, os, sys  # NB: bare "import importlib" hides .util
 missing = [m for m in ("torch", "torchvision", "diffusers", "timm", "einops",
                        "omegaconf", "torchdiffeq", "cleanfid", "scipy",
-                       "sklearn", "matplotlib", "tqdm")
+                       "sklearn", "matplotlib", "tqdm", "pyarrow")
            if importlib.util.find_spec(m) is None]
 if missing:
     print(f"ERROR: not importable: {', '.join(missing)}", file=sys.stderr)

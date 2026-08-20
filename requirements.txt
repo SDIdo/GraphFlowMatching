@@ -29,6 +29,9 @@ accelerate==1.6.0           # low_cpu_mem_usage path when loading the VAE
 # --- data ------------------------------------------------------------------
 numpy==2.0.2
 pillow==11.1.0
+# Reads ImageNet staged as HuggingFace parquet shards
+# (data/train-00000-of-00294.parquet, ...) instead of a JPEG folder tree.
+pyarrow>=14.0.0
 tqdm==4.67.1
 pyyaml==6.0.2
 
