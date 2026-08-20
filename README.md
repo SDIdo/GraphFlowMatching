@@ -209,11 +209,54 @@ sbatch --time=72:00:00 sbatch/run_gfm.sbatch imagenet   # longer budget
 sbatch sbatch/run_gfm.sbatch cifar10 sweep              # graph-correction ablation
 ```
 
+**Node exclusion.** `run_gfm.sbatch` deliberately does *not* carry an
+`#SBATCH --exclude` directive: Slurm validates node names at submission time and
+rejects the whole job if one is stale (`Invalid node name specified`). Use the
+wrapper, which keeps only the names that actually exist:
+
+```bash
+sbatch/submit.sh --check                      # audit names + GPU features
+sbatch/submit.sh --dry-run cifar10 warmup     # show the command
+sbatch/submit.sh --time=36:00:00 cifar10      # submit
+```
+
+Edit the list in `sbatch/submit.sh` (`WANT_EXCLUDE`), not in the job script.
+Plain `sbatch sbatch/run_gfm.sbatch ...` also works -- `--constraint` already
+pins the job to the four wanted GPU types, so the exclusion is belt-and-braces.
+
 Submit from the repo root. Point `DATA_ROOT_IMAGENET` at the ImageNet root and
 `WORK_DIR` at scratch; `HF_HOME`/`TORCH_HOME` default under `WORK_DIR` so model
 downloads do not hit your home quota. The job requests one GPU constrained to
 `rtx_3090|rtx_4090|rtx_6000|rtx_pro_6000` and always passes `--device cuda:0`,
 since Slurm remaps the allocated card to index 0.
+
+### Runtime
+
+Training is pure fp32 (no AMP in `train.py`), ~8.8 TFLOP/step for the default
+DiT-B/2 reaction net at batch 64. Steps per epoch: CIFAR-10 781, ImageNet-LT
+1,810, ImageNet 20,018. Rough 200-epoch training times:
+
+| dataset | rtx_3090 | rtx_4090 / 6000 | rtx_pro_6000 |
+| --- | --- | --- | --- |
+| CIFAR-10 | ~28 h | ~13 h | ~9 h |
+| ImageNet-LT | ~2.7 days | ~30 h | ~20 h |
+| ImageNet | ~30 days | ~14 days | ~9 days |
+
+One-off stages: encode ~10 min / ~30 min / 2-4 h (latents 0.4 / 0.9 / 10.5 GB),
+reference ~10-30 min, evaluate ~20-35 min. **The 24 h default `--time` is not
+enough for any 200-epoch run** -- pass `--time=36:00:00` for CIFAR-10,
+`--time=72:00:00` for ImageNet-LT, and cut `EPOCHS` for ImageNet.
+
+Rather than trusting the table, measure it: every run logs per-step wall times,
+so after a ~200-step pilot run
+
+```bash
+python scripts/estimate_runtime.py --run work/runs/cifar10/models     --dataset cifar10 --epochs 200 --batch_size 64
+```
+
+projects the full job and tells you how many epochs fit in one allocation.
+Resuming a timed-out job with `--retrain_flow_network` restores the weights only
+-- the optimizer state and cosine LR schedule restart -- so prefer one long job.
 
 The `sweep` phase runs encode/reference once, then trains and evaluates four
 variants (attention / cosine / kNN adjacency, plus a no-graph baseline) via

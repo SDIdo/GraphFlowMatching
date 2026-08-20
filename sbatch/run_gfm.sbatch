@@ -15,10 +15,25 @@
 # 3. Exact feature names with underscores (NO QUOTES)
 #SBATCH --constraint=rtx_3090|rtx_4090|rtx_6000|rtx_pro_6000
 
-# 4. Exclude the non-matching nodes.
-#    NOTE: an #SBATCH directive must be ONE physical line -- Slurm stops
-#    reading at the newline, so a wrapped list silently truncates the exclusion.
-#SBATCH --exclude=cs-1080-[01-05],cs-2080-[01-05],cs-cpu-[05-11],cs-cpu256-01,cs-pheno-[01-12],dt-2080-[01-19],ee-l40s-[01-02],ise-1080-01,ise-2080-[01-03],ise-cpu-intl-[01-28],ise-cpu128-[01-09],ise-cpu128-[11-14],ise-cpu256-[01-32],ise-pheno-[01-12]
+# 4. Node exclusion -- DELIBERATELY NOT AN #SBATCH DIRECTIVE.
+#
+#    Slurm validates --exclude at submission time and rejects the entire job if
+#    even one name is unknown to the controller:
+#        sbatch: error: Batch job submission failed: Invalid node name specified
+#    Hard-coding a long list here makes every submission hostage to the list
+#    staying in sync with the cluster. Use the wrapper instead:
+#
+#        sbatch/submit.sh cifar10 warmup
+#
+#    which intersects the wanted list with the nodes that actually exist and
+#    passes only those via --exclude on the command line. Run
+#    `sbatch/submit.sh --check` to see which names are stale.
+#
+#    The exclusion is belt-and-braces anyway: --constraint above already pins
+#    the job to the four wanted GPU types, so plain `sbatch` works fine too.
+#    If you do want it inline, uncomment ONE line (an #SBATCH directive must be
+#    a single physical line -- Slurm stops reading at the newline):
+# #SBATCH --exclude=cs-1080-[01-05],cs-2080-[01-05],cs-cpu-[05-11],cs-cpu256-01,cs-pheno-[01-12],dt-2080-[01-19],ee-l40s-[01-02],ise-1080-01,ise-2080-[01-03],ise-cpu-intl-[01-28],ise-cpu128-[01-09],ise-cpu128-[11-14],ise-cpu256-[01-32],ise-pheno-[01-12]
 
 # =============================================================================
 # Graph Flow Matching -- CIFAR-10 / ImageNet / ImageNet-LT
@@ -220,12 +235,33 @@ elif [ "$PHASE" == "sweep" ]; then
 
     # name:pipeline-flags. gaussian is deliberately absent: its kernel
     # underflows to zero on these latents and training NaNs immediately.
-    VARIANTS=(
-        "graph_attention:--adj_mode attention"
-        "graph_cosine:--adj_mode cosine"
-        "graph_knn:--adj_mode knn"
-        "no_graph:--no_diffusion"
-    )
+    #
+    # These run SERIALLY in one job, so the full sweep costs 4x a single
+    # training -- days, not hours. To spread it over four jobs instead, set
+    # GFM_VARIANTS to one entry per submission:
+    #
+    #   for v in "graph_attention:--adj_mode attention" \
+    #            "graph_cosine:--adj_mode cosine" \
+    #            "graph_knn:--adj_mode knn" \
+    #            "no_graph:--no_diffusion"; do
+    #     GFM_VARIANTS="$v" sbatch --time=36:00:00 sbatch/run_gfm.sbatch cifar10 sweep
+    #   done
+    #
+    # (encode/reference are idempotent, so re-running them per job is cheap; the
+    #  final paper build then reports whichever variants have finished.)
+    if [ -n "${GFM_VARIANTS:-}" ]; then
+        IFS=';' read -r -a VARIANTS <<< "$GFM_VARIANTS"
+    else
+        VARIANTS=(
+            "graph_attention:--adj_mode attention"
+            "graph_cosine:--adj_mode cosine"
+            "graph_knn:--adj_mode knn"
+            "no_graph:--no_diffusion"
+        )
+        echo "NOTE: running ${#VARIANTS[@]} variants serially in this one job."
+        echo "      Budget ~${#VARIANTS[@]}x a single training, or split with"
+        echo "      GFM_VARIANTS (see the comment in this script)."
+    fi
 
     for v in "${VARIANTS[@]}"; do
         name="${v%%:*}"
