@@ -707,10 +707,26 @@ train_loader, enc, dec = setup_training_components(args, dataloader_kwargs=datal
 if args.train_flow:
     # Load or create VAE
     if args.retrain_flow_network == True:
-        vel_net = torch.load(os.path.join(args.model_savepath, 'vel_net_best_fid.pt'), map_location=args.device, weights_only=False)
-        # vel_net = torch.load(os.path.join(args.model_savepath, 'vel_net.pt'), map_location=args.device, weights_only=False)
-        # RK4, RK4step = return_RK4_functions(args.base_model)
-        print("Model loaded, retraining now")
+        # Resume. 'vel_net_best_fid.pt' only exists when the in-training FID
+        # probe ran, so with --cleanfid_dataset_name none the only checkpoint on
+        # disk is the periodic 'vel_net.pt'. Prefer the best-FID one, fall back
+        # to the periodic one, and say clearly what happened -- this is the path
+        # a job that hit its Slurm time limit takes on restart.
+        _ckpts = [os.path.join(args.model_savepath, 'vel_net_best_fid.pt'),
+                  os.path.join(args.model_savepath, 'vel_net.pt')]
+        _found = next((c for c in _ckpts if os.path.exists(c)), None)
+        if _found is None:
+            raise SystemExit(
+                f"\n[resume error] --retrain_flow_network was set but neither "
+                f"checkpoint exists in {args.model_savepath}:\n"
+                + "".join(f"  {c}\n" for c in _ckpts)
+                + "Drop --retrain_flow_network to start a fresh run.\n")
+        vel_net = torch.load(_found, map_location=args.device, weights_only=False)
+        print(f"Model loaded from {_found}, retraining now")
+        print("[resume] NOTE: only the weights are restored. The optimizer "
+              "state, the cosine LR schedule and the epoch counter all restart "
+              "from zero, so a resumed run is not identical to an uninterrupted "
+              "one. Size --time to fit the whole run where you can.")
         # Freeze the reaction term if the flag is set
         if args.freeze_reaction_term:
             print("Freezing reaction term parameters.")

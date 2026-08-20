@@ -1,0 +1,50 @@
+# Graph Flow Matching -- pip requirements
+#
+# Versions match the conda environment.yml (Python 3.9, CUDA 12.4 build of
+# torch 2.6.0), which is the combination this repository was developed against.
+#
+#   python -m venv .venv && source .venv/bin/activate
+#   pip install --upgrade pip
+#   pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu124
+#
+# The --extra-index-url is what selects the CUDA wheels; without it pip installs
+# the CPU-only build of torch and every GPU run silently fails the device check
+# in train.py. Swap cu124 for the CUDA version your driver supports (cu121,
+# cu118, ...), or drop the flag entirely for a CPU-only smoke-test install.
+
+# --- core: model + training ------------------------------------------------
+torch==2.6.0
+torchvision==0.21.0
+torchdiffeq==0.2.5          # ODE solvers used by utils/utils.py:integrate_ode
+timm==1.0.15                # PatchEmbed / Attention / Mlp used by networks/DiT.py
+einops==0.8.1               # networks/ADM/attention.py
+omegaconf==2.3.0            # utils/model_utils.py reads the ADM yaml configs
+
+# --- VAE (latent space) ----------------------------------------------------
+diffusers==0.32.2           # AutoencoderKL, i.e. stabilityai/sd-vae-ft-mse
+transformers==4.50.3        # diffusers dependency
+huggingface-hub==0.30.1
+accelerate==1.6.0           # low_cpu_mem_usage path when loading the VAE
+
+# --- data ------------------------------------------------------------------
+numpy==2.0.2
+pillow==11.1.0
+tqdm==4.67.1
+pyyaml==6.0.2
+
+# --- evaluation: FID / IS / MMD / KID / t-SNE ------------------------------
+clean-fid==0.1.35           # FID against the reference Inception graph
+scipy==1.13.1               # matrix sqrtm in the Frechet distance
+scikit-learn==1.6.1         # PCA + t-SNE in evaluation/metrics.py
+matplotlib==3.9.2           # every figure
+
+# --- logging (optional) ----------------------------------------------------
+# Only needed with --use_wandb; losses are always mirrored to CSV by
+# utils/loss_logger.py, so the plots and the paper work without it.
+wandb==0.19.9
+
+# --- optional: GPS diffusion network ---------------------------------------
+# Required only for --diffusion_network gps (networks/GPS.py). It is a lazy
+# import in train.py, so leave it commented out unless you need that variant --
+# torch-geometric pulls a large, CUDA-version-specific dependency tree.
+# torch-geometric==2.6.1
