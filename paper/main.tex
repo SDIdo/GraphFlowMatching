@@ -1,0 +1,687 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{subcaption}
+\usepackage{caption}
+\usepackage{xcolor}
+\usepackage{tcolorbox}
+\usepackage{microtype}
+\usepackage{url}
+\usepackage[numbers,sort&compress]{natbib}
+\usepackage[hidelinks]{hyperref}
+\usepackage{cleveref}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{fancyvrb}
+
+\graphicspath{{figures/}}
+
+% Without this, T1 lmtt renders "--" as an en-dash, silently corrupting every
+% command-line flag in the paper.
+\DisableLigatures[-]{encoding = T1, family = tt*}
+
+\captionsetup{font=small,labelfont=bf}
+\newcommand{\code}[1]{\texttt{\small #1}}
+% Plain fancyvrb (breaklines/breakanywhere would need fvextra); the listings
+% below are wrapped by hand with shell line continuations instead.
+\DefineVerbatimEnvironment{shell}{Verbatim}%
+  {fontsize=\small, xleftmargin=1em, samepage=false}
+\newcommand{\GFM}{\textsc{GFM}}
+
+% Gracefully degrade when a figure has not been generated yet.
+\newcommand{\safeincludegraphics}[2][width=\linewidth]{%
+  \IfFileExists{figures/#2.pdf}{\includegraphics[#1]{#2.pdf}}{%
+    \IfFileExists{figures/#2.png}{\includegraphics[#1]{#2.png}}{%
+      \fbox{\parbox[c][0.26\linewidth][c]{0.88\linewidth}{\centering\small\itshape
+        figure \texttt{\detokenize{#2}} not generated yet}}}}}
+\newcommand{\safeinput}[1]{\IfFileExists{#1}{\input{#1}}{\textit{(pending)}}}
+
+\title{\bf Graph Flow Matching Beyond Faces and Bedrooms:\\
+Porting \GFM{} to CIFAR-10, ImageNet and ImageNet-LT}
+
+\author{%
+  Nathan Sde\\
+  \small Ben-Gurion University of the Negev\\
+  \small \texttt{sde.nathan@gmail.com}
+}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Graph Flow Matching (\GFM{}) augments a latent flow-matching velocity field with
+a graph-based correction term that couples every sample in a training batch to
+its neighbours. The released implementation targets four
+single-domain $256\times256$ datasets --- FFHQ, CelebA-HQ, LSUN Bedrooms and LSUN
+Churches --- and hard-codes the corresponding latent resolution, dataset
+loaders, and warm-start checkpoints. This report describes the engineering
+required to run the \emph{same, unmodified} \GFM{} velocity network on three
+substantially different datasets: CIFAR-10 (low resolution, ten balanced
+classes), ImageNet-1k (high diversity, one thousand balanced classes) and
+ImageNet-LT (the long-tailed subset, imbalance ratio $256{:}1$). We contribute a
+resolution-agnostic latent pipeline, a labelled sharded-latent storage format
+with chunk-aware batching, official/reconstructed ImageNet-LT split handling,
+offline training-curve logging, and a single evaluation harness that reports
+Fr\'echet Inception Distance (FID), Inception Score (IS), maximum mean
+discrepancy (MMD), kernel Inception distance (KID) and a joint $t$-SNE embedding
+of real and generated Inception features. \textbf{No component of the generative
+model --- neither the reaction network, the graph adjacency generator, the
+non-linear heat-diffusion correction, nor the flow-matching objective --- was
+altered};  every change is confined to data handling, configuration and
+measurement.
+\end{abstract}
+
+\safeinput{generated/status.tex}
+
+\section{Introduction}
+\label{sec:intro}
+
+Flow matching~\citep{lipman2023flow,liu2023rectified} learns a time-dependent
+velocity field $v_\theta(x,t)$ that transports a simple prior to the data
+distribution along a prescribed probability path. Latent flow
+matching~\citep{dao2023lfm} moves this construction into the latent space of a
+pretrained variational autoencoder, which makes high-resolution generation
+tractable. Graph Flow Matching~\citep{siddiqui2025gfm} observes that the
+velocity field is normally predicted \emph{independently} for each sample, and
+adds a correction term that lets samples within a batch exchange information
+through a learned graph:
+\begin{equation}
+  \label{eq:gfm}
+  v_\theta(x,t) \;=\; \underbrace{v^{\text{reac}}_{\theta_1}(x,t)}_{\text{per-sample reaction}}
+  \;+\; \underbrace{v^{\text{corr}}_{\theta_2}(x,t)}_{\text{neighbour-aware correction}} .
+\end{equation}
+In the configuration used throughout this report the correction term is the
+non-linear graph heat flow
+\begin{equation}
+  \label{eq:heat}
+  v^{\text{corr}}_{\theta_2}(x,t)
+  \;=\; -\,N_2\!\Big( G^{\!\top}\big[\sigma\big(G\,N_1(x,t)\big)\big],\; t \Big),
+\end{equation}
+where $G$ is the graph gradient operator induced by a batch adjacency matrix
+$A(x,t) \in \mathbb{R}^{B\times B}$ produced by a learned attention module,
+$(G z)_{ij} = \sqrt{A_{ij}}\,(z_i - z_j)$, and $N_1, N_2$ are small U-Nets. The
+adjacency is built \emph{across the batch dimension}, so the correction is
+resolution-agnostic by construction --- a property we exploit heavily below.
+
+\paragraph{Why porting is non-trivial.}
+Although \cref{eq:gfm,eq:heat} contain no dataset-specific assumption, the
+released code base does. Concretely, the obstacles were:
+\begin{enumerate}\itemsep2pt
+  \item \textbf{Hard-coded latent geometry.} The latent grid $32\times32$ and the
+  attention resolutions $\{32,16\}$ appear as literals in the model-construction
+  code, in the sampler and in the FID probe.
+  \item \textbf{Dataset-specific loaders only.} The four supported datasets each
+  have a bespoke loader; there is no CIFAR-10 path, the ImageNet path is
+  incomplete (its loader returns \code{(latent, label)} whereas the training loop
+  destructures \code{(x0, x1)}, so the label would be consumed as the image), and
+  there is no ImageNet-LT path at all.
+  \item \textbf{Mandatory warm start.} Training defaults to
+  \code{--use\_pretrained}, loading a public Latent-Flow-Matching checkpoint. No
+  such checkpoint exists for our three datasets.
+  \item \textbf{Mandatory in-training FID.} Checkpoints are written only inside
+  the FID-evaluation branch, which itself requires pre-built \code{clean-fid}
+  custom statistics. Without those, a run would train and save nothing.
+  \item \textbf{No offline metrics.} Losses go only to Weights \& Biases, and
+  neither IS, MMD nor any embedding visualisation exists in the repository.
+\end{enumerate}
+
+\paragraph{Contributions.}
+\begin{itemize}\itemsep2pt
+  \item A resolution-agnostic configuration path (\cref{sec:resolution}) that
+  instantiates the \emph{unchanged} networks at whatever latent grid the data
+  implies, together with a characterisation of the one latent-size limit that is
+  genuinely baked into the released attention adjacency --- guarded up front
+  rather than patched.
+  \item A labelled, sharded latent format with a chunk-aware batch sampler
+  (\cref{sec:storage}) that scales from CIFAR-10's $50$k images to ImageNet's
+  $1.28$M.
+  \item ImageNet-LT support with official-split download and a deterministic
+  Pareto reconstruction fallback (\cref{sec:imagenetlt}).
+  \item An evaluation harness (\cref{sec:protocol}) reporting FID, IS, MMD, KID
+  and $t$-SNE from a single Inception feature pass, plus offline training-curve
+  logging and plotting.
+\end{itemize}
+
+\section{Background}
+\label{sec:background}
+
+\subsection{Conditional flow matching}
+Given data $x_1 \sim q$ and noise $x_0 \sim \mathcal{N}(0, I)$, the linear
+(rectified) probability path interpolates
+$z_t = (1-t)\,x_1 + t\,x_0$ under the reverse-time convention used by this code
+base ($t=1$ is noise, $t=0$ is data), with target velocity
+$u_t = x_0 - x_1$. Training minimises
+\begin{equation}
+  \label{eq:cfm}
+  \mathcal{L}(\theta) \;=\;
+  \frac{\mathbb{E}_{t,x_0,x_1}\big\|\, v_\theta(z_t,t) - u_t \,\big\|_2^2}
+       {\mathbb{E}_{t,x_0,x_1}\big\|\, u_t \,\big\|_2^2},
+\end{equation}
+i.e.\ the mean-squared velocity error \emph{normalised by the target norm}. This
+normalisation is what makes the loss values in \cref{sec:results} comparable
+across datasets with different latent statistics; an unnormalised loss would be
+dominated by whichever dataset has the larger latent variance.
+
+\subsection{The graph correction term}
+Within a batch of $B$ latents, an attention module with an ASPP trunk and a
+sinusoidal time embedding emits a dense, non-negative adjacency
+$A(x,t)\in\mathbb{R}^{B\times B}$. \cref{eq:heat} then performs one non-linear
+diffusion step on the batch graph: $N_1$ maps each latent to a node signal, the
+weighted graph gradient forms all $B^2$ pairwise differences, a pointwise
+non-linearity $\sigma$ (ELU by default) is applied edge-wise, the weighted
+divergence contracts back to $B$ node signals, and $N_2$ maps the result to a
+velocity correction. Because every spatial dimension is flattened into the node
+feature, the operator's cost is $O(B^2 \cdot C H W)$ and is \emph{independent of
+how} $CHW$ is factorised --- the reason the same module works unchanged at
+$4\times32\times32$ and $4\times16\times16$.
+
+\section{Making \GFM{} dataset-portable}
+\label{sec:port}
+
+\begin{table}[t]
+  \centering
+  \small
+  \begin{tabular}{p{0.30\linewidth} p{0.62\linewidth}}
+    \toprule
+    Component & Change \\
+    \midrule
+    Velocity network, adjacency generator, heat-flow correction, flow-matching
+      loss, ODE solver
+      & \textbf{None.} Used exactly as released. \\
+    Model \emph{instantiation}
+      & Latent grid and attention resolutions are read from the data instead of
+        being literals. \\
+    Data loading
+      & New CIFAR-10 / ImageNet / ImageNet-LT datasets; new labelled sharded
+        latent format; chunk-aware batch sampler. \\
+    Training loop
+      & Label-tolerant batch unpacking; FID-independent checkpointing; CSV
+        logging of losses; from-scratch construction of the reaction network. \\
+    Evaluation
+      & New harness: FID, IS, MMD, KID, $t$-SNE, sample grids, curve plots. \\
+    \bottomrule
+  \end{tabular}
+  \caption{Scope of the port. The generative model itself is untouched; every
+  modification is configuration, data plumbing or measurement.}
+  \label{tab:scope}
+\end{table}
+
+\subsection{Resolution-agnostic latent geometry}
+\label{sec:resolution}
+
+The Stable-Diffusion VAE (\code{stabilityai/sd-vae-ft-mse}) downsamples by a
+factor of $8$ and emits four latent channels, so an input rendered at
+$S_{\text{img}}$ pixels yields an $S = S_{\text{img}}/8$ latent grid. We expose
+\code{--image\_size} and derive
+\begin{equation*}
+  S \;=\; S_{\text{img}}/8, \qquad
+  \texttt{latent\_size} \leftarrow S, \qquad
+  \texttt{attn\_resolutions} \leftarrow \{r \in R_0 : r \le S\},
+\end{equation*}
+clamping the configured attention resolutions so that a smaller latent grid
+cannot silently produce an unusable U-Net. When training from pre-encoded
+latents the values are instead read directly off the encoded dataset, so a
+mismatch between the CLI defaults and the data on disk is impossible.
+
+\paragraph{CIFAR-10 and the latent bottleneck.}
+CIFAR-10 is natively $32\times32$. Encoding it at native resolution would give
+$4\times4\times4$ latents --- too coarse for a patchifying transformer and far
+outside the regime the VAE was trained for. We therefore bicubically upsample
+CIFAR-10 to $S_{\text{img}}=256$, which restores exactly the $4\times32\times32$
+latents the released configuration expects, and downsample generated images back
+to $32\times32$ before measurement so that FID and IS follow the standard
+CIFAR-10 protocol. This costs compute but keeps the model bit-for-bit identical.
+A cheaper $S_{\text{img}}=128$ (a $16\times16$ latent grid) is available for the
+resolution-agnostic adjacency modes, but not for the attention adjacency the
+paper defaults to --- see the constraint below.
+
+\paragraph{One genuine model-side constraint.}
+Auditing the released code at other latent sizes surfaced a limit that
+\emph{cannot} be lifted without editing the model, and which we therefore guard
+rather than patch. The attention adjacency generator
+(\code{AdjGenerator\_Attention\_ASPP\_Time}) applies a fixed
+\code{AvgPool2d(4,4)} and then flattens a hard-coded $8\times8$ map, so its
+projection matrix only lines up when $S = 32$. We verified that
+$S \in \{8, 16, 64\}$ all fail with a shape error inside that projection,
+whereas the \code{cosine} and \code{knn} adjacencies --- which operate directly
+on the flattened latent --- run correctly at every $S$ we tested.
+\code{train.py} now rejects the invalid combination up front with an actionable
+message instead of crashing several layers deep. Consequently every experiment
+reported here uses $S_{\text{img}} = 256 \Rightarrow S = 32$, exactly the
+released geometry.
+
+We additionally found that the \code{gaussian} adjacency is numerically
+degenerate at these dimensionalities: with $\|x_i - x_j\|^2$ in the thousands,
+$\exp\!\big(-\|x_i-x_j\|^2/2T^2\big)$ underflows to exactly zero, and the
+$\sqrt{A_{ij}}$ inside the graph gradient then has an infinite derivative, so a
+run NaNs on its first backward pass. This is a property of the released code
+rather than of our port; \code{train.py} warns instead of silently proceeding.
+
+\subsection{Labelled sharded latents and chunk-aware batching}
+\label{sec:storage}
+
+Pre-encoding the dataset once removes the VAE from the training loop entirely.
+At $4\times32\times32$ in \code{fp16} a latent occupies $8$\,KiB, so CIFAR-10
+needs $\approx0.4$\,GiB, ImageNet-LT $\approx0.9$\,GiB and full ImageNet
+$\approx10$\,GiB --- the last of which does not fit in RAM. We write fixed-size
+shards
+\begin{center}\small
+\code{chunk\_00000.pt} $=$ \{\code{latents}: $[n, C, S, S]$,
+\code{labels}: $[n]$, \code{start\_idx}\}
+\end{center}
+alongside a \code{metadata.json} and a flat \code{labels.npy}. The reader keeps
+an LRU cache of a few shards; a \emph{chunk-aware batch sampler} shuffles shard
+order and shuffles within each shard, so a batch never straddles two shards and
+the cache never thrashes. This generalises the strategy the repository already
+used for LSUN Bedrooms, adding the class labels that the original format
+discards.
+
+\paragraph{Labels are carried, not consumed.}
+All new loaders emit \code{(x0, x1, y)}. The training loop unpacks $2$- or
+$3$-tuples and \emph{ignores} $y$: the flow objective in \cref{eq:cfm} stays
+unconditional, exactly as in the released code. Carrying the label costs
+nothing and is what makes the per-class $t$-SNE of \cref{sec:results} and any
+future class-conditional study possible.
+
+\subsection{ImageNet-LT}
+\label{sec:imagenetlt}
+
+ImageNet-LT~\citep{liu2019largescale} is a $115{,}846$-image subset of
+ImageNet-1k whose per-class counts follow a Pareto distribution with
+$\alpha = 6$, ranging from $1280$ images for the head class to $5$ for the tail
+class (imbalance ratio $256{:}1$). The loader fetches the official
+\code{ImageNet\_LT\_train.txt} file list from a list of mirrors and then
+\emph{verifies} it against those published statistics before use; we confirmed
+that the downloaded list is exactly $115{,}846$ images over $1000$ classes with
+head $1280$ and tail $5$.
+
+If every mirror is unreachable, the loader falls back to a \emph{deterministic
+reconstruction} that reproduces the official count profile --- same $\alpha$,
+same head and tail counts, same number of classes --- by subsampling the full
+training split, with a shuffled class order so the head is not an artefact of
+WordNet-ID ordering. The reconstruction yields $121{,}937$ images
+($+5.3\%$ relative to the official split) with identical head and tail counts.
+Which of the two was used is recorded in the encoded dataset's metadata and must
+be reported, because the reconstruction matches the official split's
+\emph{statistics} but not its exact file list.
+
+\subsection{Training-loop robustness}
+\label{sec:trainloop}
+
+Three changes were needed before a run could complete at all:
+\begin{enumerate}\itemsep2pt
+  \item \textbf{From-scratch reaction networks.} With no public checkpoint for
+  these datasets, \code{--use\_pretrained} is disabled automatically when the
+  path does not exist, and from-scratch constructors were added for the ADM and
+  ResNet reaction backbones (the DiT and PnP-U-Net ones already existed).
+  \item \textbf{FID-independent checkpointing.} Checkpoints are now written
+  every \code{--save\_every\_steps} steps regardless of whether the in-training
+  FID probe is enabled, and \code{--cleanfid\_dataset\_name none} disables that
+  probe cleanly.
+  \item \textbf{Offline curves.} Per-step and per-epoch losses, the two term
+  magnitudes, the learning rate and the FID probe are mirrored into CSV files in
+  the run directory, so \cref{fig:loss} can be regenerated without a Weights \&
+  Biases account.
+\end{enumerate}
+
+\section{Evaluation protocol}
+\label{sec:protocol}
+
+All metrics are computed from $N_{\text{gen}}$ generated images and a reference
+set of real images that passed through \emph{exactly} the same
+crop/resize pipeline as the training data --- a detail that dominates FID far
+more than any modelling choice.
+
+\paragraph{FID.} Fr\'echet Inception Distance~\citep{heusel2017gans} is computed
+with \code{clean-fid}~\citep{parmar2022aliased}, which reproduces the reference
+Inception graph and the correct resizing; the fallback path (torchvision
+Inception-V3 pool features with the usual Fr\'echet formula) is reported
+separately when \code{clean-fid} is unavailable, since the two are not
+numerically interchangeable.
+
+\paragraph{Inception Score.} IS~\citep{salimans2016improved} is
+$\exp\big(\mathbb{E}_x\,\mathrm{KL}(p(y\mid x)\,\|\,p(y))\big)$, averaged over
+$10$ splits, from the $1000$-way softmax of torchvision's Inception-V3. We also
+report the IS of the \emph{real} reference set, which is the practical ceiling
+for that dataset at that resolution and makes the generated score
+interpretable --- an absolute IS is otherwise meaningless across resolutions.
+
+\paragraph{MMD.} We use the unbiased U-statistic estimator with a
+multi-bandwidth radial basis kernel on the $2048$-d Inception features:
+\begin{equation}
+  \label{eq:mmd}
+  \widehat{\mathrm{MMD}}^2_u(X,Y) =
+  \frac{1}{m(m-1)}\sum_{i\neq j} k(x_i,x_j)
+  + \frac{1}{n(n-1)}\sum_{i\neq j} k(y_i,y_j)
+  - \frac{2}{mn}\sum_{i,j} k(x_i,y_j),
+\end{equation}
+with $k(a,b) = \frac{1}{|\mathcal{S}|}\sum_{s\in\mathcal{S}}
+\exp\!\big(-\|a-b\|^2/(2 s\sigma^2)\big)$, $\mathcal{S} = \{0.25, 0.5, 1, 2,
+4\}$ and $\sigma^2$ set by the median heuristic on the pooled sample. Features
+are standardised by the real set's per-dimension mean and standard deviation so
+that the kernel is not dominated by the few Inception coordinates with the
+largest raw scale. Because the full $N\times N$ Gram matrix is unnecessary at
+these sample sizes, the estimate is averaged over $20$ random subsets of $2000$
+images --- the same subset scheme KID conventionally uses --- and we report the
+mean together with its across-subset standard deviation. We quote
+$\widehat{\mathrm{MMD}} = \sqrt{\max(\widehat{\mathrm{MMD}}^2_u, 0)}$; the
+clamp is needed because the unbiased estimator can go negative when the two
+distributions are close.
+
+\paragraph{KID.} For continuity with the generative-modelling literature we also
+report KID~\citep{binkowski2018demystifying}, the same U-statistic with the cubic
+polynomial kernel $k(a,b) = (a^\top b/d + 1)^3$ over $100$ subsets of $1000$
+images. KID is unbiased and therefore far more reliable than FID at small
+$N_{\text{gen}}$.
+
+\paragraph{$t$-SNE.} Real and generated Inception features are standardised,
+reduced to $50$ dimensions by PCA, and jointly embedded with
+$t$-SNE~\citep{maaten2008visualizing} (perplexity $30$, PCA initialisation).
+Embedding both sets \emph{jointly} is essential: separate embeddings are not
+comparable, since $t$-SNE coordinates carry no absolute meaning. For CIFAR-10 we
+additionally colour the real points by ground-truth class, which exposes whether
+the unconditional model covers all ten modes or collapses onto a subset.
+
+\paragraph{Sampling.} Samples are drawn by integrating the learned velocity
+field with the repository's own \code{integrate\_ode} routine, unchanged, using
+the same solver and step count the run was validated with (\cref{tab:config}).
+The number of function evaluations is $4\times$ the step count for RK4.
+
+\section{Experimental setup}
+\label{sec:setup}
+
+\begin{table}[t]
+  \centering
+  \small
+  \safeinput{generated/config_table.tex}
+  \caption{Training configuration per dataset, read back from each run's
+  \code{run\_config.json}.}
+  \label{tab:config}
+\end{table}
+
+All three datasets are pre-encoded once with \code{sd-vae-ft-mse} at
+$S_{\text{img}} = 256$ and trained from scratch with the non-linear
+heat-diffusion coupling and attention-based adjacency, i.e.\ the configuration
+the original paper reports as its default. \cref{tab:config} lists the exact
+settings recovered from each run.
+
+\section{Results}
+\label{sec:results}
+
+\subsection{Training loss}
+
+\Cref{fig:loss} shows the flow-matching objective of \cref{eq:cfm} over training
+and \cref{tab:loss} summarises each run. Because the loss is divided by the
+target-velocity norm it starts at exactly $1.0$ for an untrained network --- the
+model predicting zero velocity --- so the curve reads directly as the fraction of
+the target velocity the model still fails to explain, and is comparable across
+datasets with very different latent statistics.
+
+\Cref{fig:terms} separates the two additive terms of \cref{eq:gfm}. The graph
+correction is expected to stay well below the per-sample reaction term: it is a
+refinement of an already-reasonable velocity field, and a correction that grew
+to dominate would indicate the reaction network had failed to learn. Tracking
+both magnitudes is the cheapest available diagnostic that the graph branch is
+contributing without destabilising training.
+
+
+\begin{figure}[t]
+  \centering
+  \safeincludegraphics[width=\linewidth]{loss_curve}
+  \caption{Flow-matching training loss (\cref{eq:cfm}). \emph{Left:} per-step
+  loss, faint lines raw and solid lines exponentially smoothed. \emph{Right:}
+  per-epoch mean. The loss is normalised by the target-velocity norm, so values
+  are directly comparable across datasets.}
+  \label{fig:loss}
+\end{figure}
+
+\begin{figure}[t]
+  \centering
+  \begin{subfigure}[t]{0.48\linewidth}
+    \centering
+    \safeincludegraphics[width=\linewidth]{loss_terms}
+    \caption{Reaction vs.\ graph-correction magnitude.}
+    \label{fig:terms}
+  \end{subfigure}\hfill
+  \begin{subfigure}[t]{0.48\linewidth}
+    \centering
+    \safeincludegraphics[width=\linewidth]{fid_curve}
+    \caption{In-training FID probe.}
+    \label{fig:fidcurve}
+  \end{subfigure}
+  \caption{Auxiliary training diagnostics. \cref{fig:terms} tracks
+  $\max|\cdot|$ of the two additive terms of \cref{eq:gfm}; the correction term
+  staying several orders of magnitude below the reaction term is the expected
+  regime --- it is a \emph{correction}, not a replacement.}
+  \label{fig:diag}
+\end{figure}
+
+\begin{table}[t]
+  \centering
+  \small
+  \safeinput{generated/loss_table.tex}
+  \caption{Training summary per dataset.}
+  \label{tab:loss}
+\end{table}
+
+\subsection{Generative quality}
+
+\Cref{tab:results} reports FID, IS, MMD and KID for each dataset, and
+\cref{tab:reference} pairs the generated Inception Score with that of the real
+reference set at the same resolution. The reference column matters: an absolute
+IS is not interpretable across resolutions or preprocessing pipelines, so the
+quantity to read is the gap between the two columns rather than either number
+alone. The same logic applies to MMD, which is reported on features standardised
+by the real set's statistics and is therefore on a comparable scale across rows.
+
+
+\begin{table}[t]
+  \centering
+  \small
+  \safeinput{generated/results_table.tex}
+  \caption{Generative quality. FID and MMD lower is better; IS higher is better.
+  MMD is $\sqrt{\max(\widehat{\mathrm{MMD}}^2_u,0)}$ on standardised Inception
+  features (\cref{eq:mmd}). ``Res.'' is the resolution the metrics were computed
+  at: $32$ for CIFAR-10 (standard protocol) and $256$ for the ImageNet
+  variants.}
+  \label{tab:results}
+\end{table}
+
+\begin{table}[t]
+  \centering
+  \small
+  \safeinput{generated/reference_table.tex}
+  \caption{Inception Score of the real reference set alongside the generated
+  score. The real column is the practical ceiling at that resolution and makes
+  the generated value interpretable.}
+  \label{tab:reference}
+\end{table}
+
+\subsection{Feature-space geometry}
+
+FID compresses the comparison to a single Gaussian moment-match, which hides
+whether a model covers every mode or concentrates on a few. \Cref{fig:tsne}
+embeds real and generated Inception features \emph{jointly}, so the two point
+clouds live in one coordinate system and their overlap is meaningful: an
+isolated cluster of generated points is a mode the model invents, and a region
+of real points with no generated neighbours is a mode it misses.
+\Cref{fig:tsneclass} makes this concrete for CIFAR-10 by colouring the real
+points by ground-truth class --- since training is unconditional, whether the
+generated cloud spreads across all ten class regions is exactly the question of
+interest.
+
+
+\begin{figure}[t]
+  \centering
+  \begin{subfigure}[t]{0.32\linewidth}
+    \centering
+    \safeincludegraphics[width=\linewidth]{tsne_cifar_10}
+    \caption{CIFAR-10}
+  \end{subfigure}\hfill
+  \begin{subfigure}[t]{0.32\linewidth}
+    \centering
+    \safeincludegraphics[width=\linewidth]{tsne_imagenet}
+    \caption{ImageNet}
+  \end{subfigure}\hfill
+  \begin{subfigure}[t]{0.32\linewidth}
+    \centering
+    \safeincludegraphics[width=\linewidth]{tsne_imagenet_lt}
+    \caption{ImageNet-LT}
+  \end{subfigure}
+  \caption{Joint $t$-SNE embedding of Inception features for real (blue) and
+  \GFM{}-generated (red) images. Overlap indicates that the generated
+  distribution covers the real one; an isolated red cluster indicates a mode the
+  model invents, and an uncovered blue region a mode it misses.}
+  \label{fig:tsne}
+\end{figure}
+
+\begin{figure}[t]
+  \centering
+  \safeincludegraphics[width=0.62\linewidth]{tsne_cifar_10_byclass}
+  \caption{CIFAR-10 $t$-SNE with real points coloured by ground-truth class and
+  generated points in grey. Because the model is trained unconditionally, this
+  is the direct test of whether it covers all ten modes.}
+  \label{fig:tsneclass}
+\end{figure}
+
+\subsection{Qualitative samples}
+
+\Cref{fig:samples} shows uncurated samples --- the first $64$ images the sampler
+produced, not a selection --- decoded from the flow-matched latents with the same
+frozen VAE used for encoding.
+
+
+\begin{figure}[t]
+  \centering
+  \begin{subfigure}[t]{0.32\linewidth}
+    \centering
+    \safeincludegraphics[width=\linewidth]{samples_cifar_10}
+    \caption{CIFAR-10}
+  \end{subfigure}\hfill
+  \begin{subfigure}[t]{0.32\linewidth}
+    \centering
+    \safeincludegraphics[width=\linewidth]{samples_imagenet}
+    \caption{ImageNet}
+  \end{subfigure}\hfill
+  \begin{subfigure}[t]{0.32\linewidth}
+    \centering
+    \safeincludegraphics[width=\linewidth]{samples_imagenet_lt}
+    \caption{ImageNet-LT}
+  \end{subfigure}
+  \caption{Uncurated samples, decoded from the flow-matched latents.}
+  \label{fig:samples}
+\end{figure}
+
+\section{Discussion and limitations}
+\label{sec:discussion}
+
+\paragraph{The port is a portability study, not a tuning study.}
+No hyper-parameter was optimised for the new datasets: learning rate, batch
+size, network widths, solver and step count are inherited from the released
+LSUN/CelebA configurations. Numbers in \cref{tab:results} should therefore be
+read as \emph{what \GFM{} does out of the box} on these datasets, not as its
+attainable ceiling. In particular, ImageNet and ImageNet-LT results are far more
+sensitive to training budget than the single-domain datasets \GFM{} was
+developed on.
+
+\paragraph{Unconditional training on class-labelled data.}
+ImageNet and ImageNet-LT are usually modelled class-conditionally, and the
+state-of-the-art FIDs quoted for them assume classifier-free guidance. We train
+unconditionally to keep the model unchanged, so our numbers are not comparable
+to conditional ImageNet literature. The labels are carried through the pipeline,
+so enabling the repository's existing conditional coupling is a configuration
+change rather than new modelling work.
+
+\paragraph{CIFAR-10 through a $256$-pixel VAE.}
+Upsampling CIFAR-10 to $256$ and decoding back to $32$ passes every image
+through a VAE round-trip it was not designed for. The reconstruction error of
+that round-trip is a floor on the achievable FID that is independent of the flow
+model. Reporting the reference-set IS (\cref{tab:reference}) partially exposes
+this, but a VAE-reconstruction FID would isolate it exactly and is the natural
+next diagnostic.
+
+\paragraph{Batch-size coupling.}
+The graph correction is computed over the training batch, so the adjacency
+$A \in \mathbb{R}^{B\times B}$ --- and hence the function the model computes --- is
+batch-size dependent. Comparisons across runs are only meaningful at equal $B$.
+At sampling time the same coupling applies, which is why the evaluation harness
+generates with a fixed batch size.
+
+\paragraph{ImageNet-LT split provenance.}
+If the official file list could not be fetched, the reported numbers use the
+Pareto reconstruction of \cref{sec:imagenetlt}. It matches the official split's
+count profile but not its file list, and results are consequently not directly
+comparable to published ImageNet-LT numbers. The provenance string is stored in
+the encoded dataset's metadata for exactly this reason.
+
+\section{Reproducing this report}
+\label{sec:repro}
+
+The whole sequence is driven by \code{scripts/run\_pipeline.py}; the individual
+stages are listed below so any one of them can be re-run in isolation. Swap
+\code{cifar10} for \code{imagenet} or \code{imagenet-lt} and point
+\code{--data\_root} at the ImageNet root that holds \code{train/} and
+\code{val/}.
+
+\paragraph{1. Pre-encode the dataset into sharded latents.}
+\begin{shell}
+python datasets/encode_new_datasets.py \
+    --dataset cifar10 --data_root ./data/cifar10 \
+    --out_root ./work/encoded/cifar10_256 \
+    --image_size 256 --batch_size 64 --device cuda:0
+\end{shell}
+
+\paragraph{2. Build the reference set and the clean-fid statistics.}
+\begin{shell}
+python datasets/make_reference_set.py \
+    --dataset cifar10 --data_root ./data/cifar10 \
+    --out_dir ./work/reference/cifar10_32 \
+    --source_image_size 256 --eval_image_size 32 \
+    --num_images 50000 --cleanfid_name cifar10_gfm_32
+\end{shell}
+
+\paragraph{3. Train --- unchanged model, new configuration.}
+\begin{shell}
+python train.py --dataset cifar10 --use_pre_encoded \
+    --encoded_dataset_path ./work/encoded/cifar10_256 \
+    --image_size 256 --base_model dit --diffusion --adj_mode attention \
+    --flow_model_type nonLinearHeatDiffusion2 \
+    --model_savepath ./work/runs/cifar10/models \
+    --image_savepath ./work/runs/cifar10/images \
+    --train_batch_size 64 --flow_epochs 200 \
+    --cleanfid_dataset_name none --device cuda:0
+\end{shell}
+
+\paragraph{4. Evaluate: FID, IS, MMD, KID, $t$-SNE, sample grid.}
+\begin{shell}
+python evaluation/evaluate_gfm.py \
+    --checkpoint ./work/runs/cifar10/models/vel_net_best_fid.pt \
+    --model_savepath ./work/runs/cifar10/models \
+    --dataset cifar10 --run_name cifar10 \
+    --reference_dir ./work/reference/cifar10_32 \
+    --out_dir ./work/results/cifar10 \
+    --num_samples 10000 --latent_size 32 --eval_image_size 32 \
+    --cleanfid_dataset_name cifar10_gfm_32 --device cuda:0
+\end{shell}
+
+\paragraph{5. Plot the curves, fill the tables, typeset.}
+\begin{shell}
+python scripts/plot_training_curves.py \
+    --run CIFAR-10=./work/runs/cifar10/models
+python scripts/build_paper.py \
+    --result CIFAR-10=./work/results/cifar10 \
+    --run CIFAR-10=./work/runs/cifar10/models
+cd paper && latexmk -pdf main.tex
+\end{shell}
+
+\bibliographystyle{plainnat}
+\bibliography{refs}
+
+\end{document}
