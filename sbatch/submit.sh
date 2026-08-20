@@ -51,6 +51,11 @@ done
 
 command -v sbatch >/dev/null 2>&1 || { echo "ERROR: sbatch not found; are you on a submit host?" >&2; exit 1; }
 
+# Slurm opens --output/--error BEFORE the job script runs. If this directory
+# is missing the job is launched and then dies immediately with no log at
+# all, which looks exactly like "it finished but produced nothing".
+mkdir -p sbatch/logs
+
 # ---- 1. which of the wanted exclusions actually exist? ----------------------
 KNOWN_NODES="$(sinfo -h -N -o '%N' 2>/dev/null | tr -d '\r' | LC_ALL=C sort -u || true)"
 if [ -z "$KNOWN_NODES" ]; then

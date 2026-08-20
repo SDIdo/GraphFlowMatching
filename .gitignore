@@ -29,5 +29,17 @@ paper/figures/*.pdf
 work/
 runs/
 results/
+# Slurm opens --output BEFORE the job script runs, so sbatch/logs/ must
+# already exist or the job dies at launch with no log at all. Ignore the
+# log files but keep the directory marker -- note the directory itself has
+# to be un-ignored first, because git will not re-include a file whose
+# parent directory is excluded (by `logs/` above).
+!sbatch/logs/
+!sbatch/logs/.gitkeep
 sbatch/logs/*.out
 sbatch/logs/*.err
+
+# Virtualenvs -- never commit, and protect from `git clean -fd`
+.venv/
+venv/
+env/

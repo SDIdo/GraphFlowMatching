@@ -66,12 +66,12 @@
 #     sbatch --time=72:00:00 sbatch/run_gfm.sbatch imagenet-lt encode,reference,train,evaluate
 #     EPOCHS=25 sbatch --time=96:00:00 sbatch/run_gfm.sbatch imagenet encode,reference,train,evaluate
 #     # ...then once everything has finished:
-#     sbatch sbatch/run_gfm.sbatch cifar10 report
+#     sbatch sbatch/run_gfm.sbatch all report        # covers ALL datasets
 #
 #   The 'report' phase scans WORK_DIR and rebuilds the figures and tables from
 #   every run it finds, so unfinished datasets simply show as '--' until they
 #   land. It needs no GPU, so it can also be run straight on a login node:
-#       bash sbatch/run_gfm.sbatch cifar10 report
+#       bash sbatch/run_gfm.sbatch all report
 #
 #   Run 'warmup' first and let it finish: parallel cold starts would otherwise
 #   race each other downloading into the same HF_HOME/TORCH_HOME.
@@ -134,7 +134,17 @@ shift || true
 
 case "$DATASET" in
     cifar10|imagenet|imagenet-lt) ;;
-    *) echo "ERROR: unknown dataset '$DATASET' (cifar10|imagenet|imagenet-lt)" >&2
+    all|any)
+        # The report/plot/paper phases scan WORK_DIR and cover every dataset at
+        # once, so naming a single one is misleading. Accept 'all' for them.
+        case "$PHASE" in
+            report|plot|paper) ;;
+            *) echo "ERROR: dataset 'all' is only valid for the report/plot/paper" >&2
+               echo "       phases (they aggregate every run under WORK_DIR)." >&2
+               echo "       For '$PHASE', name one of: cifar10|imagenet|imagenet-lt" >&2
+               exit 2 ;;
+        esac ;;
+    *) echo "ERROR: unknown dataset '$DATASET' (cifar10|imagenet|imagenet-lt|all)" >&2
        exit 2 ;;
 esac
 
@@ -182,8 +192,10 @@ if [ "$DATASET" != "cifar10" ] && [ "$PHASE" != "report" ] && [ "$PHASE" != "war
         echo "         DATA_ROOT_IMAGENET=/path/to/imagenet \\" >&2
         echo "           sbatch --time=72:00:00 sbatch/run_gfm.sbatch $DATASET $PHASE" >&2
         echo >&2
-        echo "       It must contain the 1000 wnid folders, either directly or" >&2
-        echo "       under train/ .  To hunt for an existing copy on the cluster:" >&2
+        echo "       It must hold EITHER the 1000 wnid folders (directly or under" >&2
+        echo "       train/) OR HuggingFace parquet shards (*.parquet, directly or" >&2
+        echo "       under data/).  To hunt for an existing copy on the cluster:" >&2
+        echo "         find / -maxdepth 5 -name 'train-00000-of-*.parquet' 2>/dev/null | head" >&2
         echo "         ls -d /datasets /data /scratch /storage /mnt/* 2>/dev/null" >&2
         echo "         find / -maxdepth 4 -type d -name 'n01440764' 2>/dev/null | head" >&2
         echo "       (n01440764 is the first ImageNet class; finding it locates the tree.)" >&2
