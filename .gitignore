@@ -43,3 +43,6 @@ sbatch/logs/*.err
 .venv/
 venv/
 env/
+
+# Per-site cluster paths -- machine specific, never commit
+sbatch/site.env

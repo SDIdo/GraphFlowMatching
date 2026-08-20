@@ -156,6 +156,17 @@ mkdir -p sbatch/logs
 source .venv/bin/activate
 # -------------------------------------------------------
 
+# Per-site paths (ImageNet root, scratch, ...). Sourced before anything else so
+# an explicit VAR=... on the sbatch command line still overrides it, since the
+# file only sets values that are not already in the environment.
+if [ -f sbatch/site.env ]; then
+    echo "[setup] sourcing sbatch/site.env"
+    set -a
+    # shellcheck disable=SC1091
+    . sbatch/site.env
+    set +a
+fi
+
 # Keep model downloads off $HOME -- home quotas are usually far too small for
 # the SD-VAE (~330 MB) plus the Inception weights (~105 MB), and a quota error
 # mid-run looks like an unrelated crash.
