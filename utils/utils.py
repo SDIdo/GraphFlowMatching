@@ -104,6 +104,50 @@ def load_vae(args, load_encoder=True, load_decoder=True):
 from datasets.datasets_256 import AFHQInMemoryDataset_256, PreEncoded_AFHQ_256_Dataset, CelebAHQ256Dataset, PreEncoded_CelebAHQ256_Dataset, PreEncoded_FFHQ_Dataset, FFHQ256Dataset
 # from datasets.lsun_datasets import LSUNBedroomDataset
 from datasets.datasets_256 import LSUNChurchDataset, LSUNBedroomDataset, PreEncoded_LSUNChurch_Dataset, PreEncoded_LSUNBedroom_Dataset, LSUN_Bedrooms_ChunkAwareBatchSampler
+
+# Datasets added on top of the released GFM configurations.  They share the
+# sharded-latent layout of datasets/latent_shards.py and build their own
+# DataLoader (chunk-aware batch sampler), so they are skipped by the generic
+# DataLoader construction further down, exactly like 'lsun_bedrooms'.
+NEW_DATASETS = ('cifar10', 'imagenet', 'imagenet-lt')
+
+# Datasets whose branch already produced a train_loader of its own.
+SELF_LOADING_DATASETS = ('lsun_bedrooms',) + NEW_DATASETS
+
+
+def _make_subset(train_dataset, subset_frac, seed=0):
+    """Take a random fraction of a dataset, preserving chunk metadata."""
+    from torch.utils.data import Subset
+    total = len(train_dataset)
+    size = max(1, int(total * subset_frac))
+    indices = np.random.RandomState(seed).permutation(total)[:size].tolist()
+    subset = Subset(train_dataset, indices)
+    for attr in ('chunk_size', 'full_chunk_size', 'latent_shape'):
+        if hasattr(train_dataset, attr):
+            setattr(subset, attr, getattr(train_dataset, attr))
+    print(f"Using subset of {size}/{total} samples "
+          f"({subset_frac*100:.1f}%) for training.")
+    return subset
+
+
+def _sync_latent_shape(args, dataset):
+    """Make args.latent_channels / args.latent_size agree with the data.
+
+    The velocity network is built from these two numbers, so a mismatch between
+    the encoded latents and the CLI defaults would silently produce a model that
+    cannot consume its own dataset.  The data wins; the model is untouched apart
+    from being instantiated at the right shape.
+    """
+    c, s = dataset.latent_channels, dataset.latent_size
+    if getattr(args, 'latent_channels', c) != c:
+        print(f"[setup] latent_channels {args.latent_channels} -> {c} (from data)")
+    if getattr(args, 'latent_size', s) != s:
+        print(f"[setup] latent_size {args.latent_size} -> {s} (from data)")
+    args.latent_channels = c
+    args.latent_size = s
+    return args
+
+
 def setup_training_components(args, dataloader_kwargs=None, decoder_require_gradients=False):
     """
     Set up the components needed for training based on whether we're using
@@ -146,6 +190,32 @@ def setup_training_components(args, dataloader_kwargs=None, decoder_require_grad
             train_dataset = PreEncoded_FFHQ_Dataset(
                 encoded_dataset_path=os.path.join(args.encoded_dataset_path, "encoded_dataset.pt")
             )
+        elif args.dataset in NEW_DATASETS:
+            # CIFAR-10 / ImageNet / ImageNet-LT pre-encoded into the sharded
+            # latent layout written by datasets/encode_new_datasets.py.
+            from datasets.latent_shards import ShardedLatentDataset, ChunkAwareBatchSampler
+            print(f"Using sharded pre-encoded {args.dataset} latents from "
+                  f"{args.encoded_dataset_path}")
+            train_dataset = ShardedLatentDataset(
+                args.encoded_dataset_path,
+                cache_chunks=getattr(args, 'latent_cache_chunks', 2),
+                return_label=True)
+            print(f"  {len(train_dataset)} latents of shape "
+                  f"{train_dataset.latent_shape} in {train_dataset.num_chunks} chunks")
+            _sync_latent_shape(args, train_dataset)
+
+            if args.subset_frac < 1.0:
+                train_dataset = _make_subset(train_dataset, args.subset_frac)
+
+            batch_sampler = ChunkAwareBatchSampler(
+                train_dataset, batch_size=args.train_batch_size,
+                shuffle=True, seed=getattr(args, 'seed', 0))
+            train_loader = DataLoader(
+                train_dataset,
+                batch_sampler=batch_sampler,
+                num_workers=args.num_workers,
+                pin_memory=True,
+                **dataloader_kwargs)
         elif args.dataset == 'imnet':
             from datasets.imagenet_dataset import make_imagenet_train_loader, ImageNetLatents
             print(f"Loading ImageNet ILSVRC dataset. Using pre-encoded ImageNet dataset from {args.encoded_dataset_path}")
@@ -163,7 +233,7 @@ def setup_training_components(args, dataloader_kwargs=None, decoder_require_grad
                 randomize_initial=True
             )
 
-        if args.dataset not in ['lsun_bedrooms']:
+        if args.dataset not in SELF_LOADING_DATASETS:
             if args.subset_frac < 1.0:
                 total_samples = len(train_dataset)
                 subset_size = int(total_samples * args.subset_frac)
@@ -175,7 +245,7 @@ def setup_training_components(args, dataloader_kwargs=None, decoder_require_grad
                 if hasattr(train_dataset, 'chunk_size'):
                     subset_dataset.chunk_size = train_dataset.chunk_size
                 train_dataset = subset_dataset
-                print(f"Using subset of {subset_size}/{total_samples} samples ({args.subset_frac*100:.1f}%) for training.") 
+                print(f"Using subset of {subset_size}/{total_samples} samples ({args.subset_frac*100:.1f}%) for training.")
             train_loader = DataLoader(
                 train_dataset,
                 batch_size=args.train_batch_size,
@@ -231,6 +301,27 @@ def setup_training_components(args, dataloader_kwargs=None, decoder_require_grad
             train_dataset = LSUNBedroomDataset(root_dir=args.datapath, use_horizontal_flips=False)
         elif args.dataset == 'ffhq':
             train_dataset = FFHQ256Dataset(root_dir=args.datapath, use_horizontal_flips=False)
+        elif args.dataset in NEW_DATASETS:
+            # Raw-image mode: the VAE encodes every batch on the fly.  Slower
+            # than --use_pre_encoded, but needs no offline encoding pass.
+            from datasets.gfm_image_datasets import build_image_dataset
+            image_size = getattr(args, 'image_size', 256)
+            print(f"Using raw {args.dataset} images from {args.datapath} "
+                  f"at {image_size}x{image_size} (VAE encodes on the fly)")
+            train_dataset = build_image_dataset(
+                args.dataset, args.datapath, split='train',
+                image_size=image_size,
+                use_horizontal_flips=getattr(args, 'use_horizontal_flips', False),
+                return_label=True,
+                imagenet_subdir=getattr(args, 'imagenet_subdir', 'train'),
+                split_file=getattr(args, 'imagenet_lt_split_file', None),
+                allow_pareto_fallback=not getattr(args, 'no_pareto_fallback', False),
+                pareto_seed=getattr(args, 'pareto_seed', 0),
+            )
+            args.latent_size = image_size // 8
+            args.latent_channels = 4
+            if hasattr(train_dataset, 'imbalance_report'):
+                print(f"  imbalance: {train_dataset.imbalance_report()}")
         else:
             print(f"Using original AFHQ Cat dataset from {args.datapath}")
             train_dataset = AFHQInMemoryDataset_256(

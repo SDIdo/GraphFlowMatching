@@ -9,3 +9,25 @@ logs/
 data/
 *.zip
 .DS_Store
+
+# LaTeX build artefacts
+paper/*.aux
+paper/*.bbl
+paper/*.blg
+paper/*.fdb_latexmk
+paper/*.fls
+paper/*.log
+paper/*.out
+paper/*.pdf
+paper/*.toc
+paper/*.synctex.gz
+paper/build.log
+paper/figures/*.png
+paper/figures/*.pdf
+
+# pipeline outputs
+work/
+runs/
+results/
+sbatch/logs/*.out
+sbatch/logs/*.err

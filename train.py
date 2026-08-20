@@ -75,8 +75,14 @@ torch.cuda.empty_cache()
 # from ConsistencyFM import NCSNpp, get_model_config_32x32
 
 ### DATA ####
-parser.add_argument('--dataset', type=str, default='lsun_bedrooms', choices=['ffhq','lsun_bedrooms', 'lsun_church', 'celeba-hq', 'AFHQ-Cat-Full-256']) #'lsun_bedrooms', 'AFHQ-Cat-256'
-parser.add_argument('--datapath', type=str, default="/home/shahriar/data/lsun", choices=["/home/shahriar/data/FFHQ/FFHQ_256", "/home/shahriar/data/lsun", "/home/shahriar/data/celeba/celeba_hq_256", "/data/shahriar/datasets/celeba/celeba_hq_256", "/home/shahriar/data/afhq_v2"]) #/home/shahriar/data/afhq_v2 #before: /home/shahriar/data/afhq
+parser.add_argument('--dataset', type=str, default='lsun_bedrooms',
+                    choices=['ffhq', 'lsun_bedrooms', 'lsun_church', 'celeba-hq',
+                             'AFHQ-Cat-Full-256', 'imnet',
+                             # datasets added by this work:
+                             'cifar10', 'imagenet', 'imagenet-lt'])
+parser.add_argument('--datapath', type=str, default="/home/shahriar/data/lsun",
+                    help='Root directory of the raw image dataset. For the new datasets this is '
+                         'the CIFAR-10 download dir or the ImageNet root containing train/ and val/.')
 # Parse arguments - add new arguments for pre-encoded data
 parser.add_argument('--use_pre_encoded', action='store_true', 
                     help='Use pre-encoded dataset instead of original AFHQ dataset')
@@ -84,21 +90,53 @@ parser.add_argument('--no-use_pre_encoded', dest='use_pre_encoded', action='stor
                     help='Use original AFHQ dataset')
 parser.set_defaults(use_pre_encoded=True)
 
-parser.add_argument('--encoded_dataset_path', type=str, default="/data/shahriar/datasets/lsun/lsun_encoded_mse/lsun_bedrooms", choices=["/data/shahriar/datasets/lsun/lsun_encoded_mse/lsun_bedrooms",
-                                                                                                                                         "/home/shahriar/data/FFHQ/FFHQ_256_mse_encoded",
-                                                                                                                                    "/home/shahriar/data/lsun/lsun_encoded_mse/lsun_bedrooms", 
-                                                                                                                                    "/home/shahriar/data/lsun/lsun_encoded_mse/church_train", 
-                                                                                                                                    "/home/shahriar/data/celeba/celeba_hq_256_encoded_noFlips",
-                                                                                                                                     "/data/shahriar/datasets/celeba/celeba_hq_256_encoded_noFlips", 
-                                                                                                                                    '/data/shahriar/datasets/celeba/celeba_hq_256_encoded', 
-                                                                                                                                    '/home/shahriar/data/celeba/celeba_hq_256_encoded',
-                                                                                                                                    "/home/shahriar/data/afhq_v2_encoded_mse", 
-                                                                                                                                    "/data/shahriar/datasets/afhq_v2_encoded_mse"],
-                    help='Path to pre-encoded dataset directory')
+parser.add_argument('--encoded_dataset_path', type=str,
+                    default="/data/shahriar/datasets/lsun/lsun_encoded_mse/lsun_bedrooms",
+                    help='Path to the pre-encoded dataset directory')
 
-parser.add_argument('--cleanfid_dataset_name', type=str, default='lsun_bedrooms_256_all', choices=['ffhq_256_all', 'lsun_bedrooms_256_all', 'lsun_church_256_train', 'celeba_256', "afhq_cat_256_train_test_full"], help='Integration method to use')
+parser.add_argument('--cleanfid_dataset_name', type=str, default='lsun_bedrooms_256_all',
+                    help="Name of the registered clean-fid custom statistics used for "
+                         "in-training FID. Known names for the original datasets: "
+                         "ffhq_256_all, lsun_bedrooms_256_all, lsun_church_256_train, "
+                         "celeba_256, afhq_cat_256_train_test_full. Create new ones with "
+                         "datasets/make_reference_set.py --cleanfid_name <name>. "
+                         "Pass 'none' to skip FID during training entirely.")
 
 parser.add_argument('--lsun_bedrooms_dataset_cache_chunks', type=int, default=10, help='Number of chunks to cache for LSUN Bedrooms dataset')
+
+########################################################################
+# CIFAR-10 / ImageNet / ImageNet-LT support.
+# These only describe the *data*; the velocity network is unchanged, it is
+# simply instantiated at the latent resolution implied by --image_size.
+########################################################################
+parser.add_argument('--image_size', type=int, default=256,
+                    help='Resolution images are rendered at before the VAE. '
+                         'The latent grid is image_size/8, so 256 -> 32x32 '
+                         'latents, i.e. exactly the released configuration. '
+                         'CIFAR-10 is bicubically upsampled to this size.')
+parser.add_argument('--latent_size', type=int, default=32,
+                    help='Spatial size of the VAE latents the flow model sees. '
+                         'Overridden automatically from the encoded dataset.')
+parser.add_argument('--latent_cache_chunks', type=int, default=2,
+                    help='Latent shards kept in RAM by ShardedLatentDataset')
+parser.add_argument('--imagenet_subdir', type=str, default='train',
+                    help='Sub-directory of --datapath holding the wnid folders')
+parser.add_argument('--imagenet_lt_split_file', type=str, default=None,
+                    help='Path to ImageNet_LT_train.txt (auto-downloaded if unset)')
+parser.add_argument('--no_pareto_fallback', action='store_true',
+                    help='Fail instead of reconstructing an ImageNet-LT split')
+parser.add_argument('--pareto_seed', type=int, default=0,
+                    help='Seed for the reconstructed ImageNet-LT split')
+parser.add_argument('--use_horizontal_flips', action='store_true', default=False,
+                    help='Random horizontal flips in raw-image (non pre-encoded) mode')
+parser.add_argument('--wandb_project', type=str, default=None,
+                    help='wandb project name (defaults to a per-dataset name)')
+parser.add_argument('--csv_log', action='store_true', default=True,
+                    help='Mirror losses/FID into CSV files under --model_savepath')
+parser.add_argument('--no-csv_log', dest='csv_log', action='store_false')
+parser.add_argument('--save_every_steps', type=int, default=1000,
+                    help='Checkpoint vel_net.pt every N steps, independently of '
+                         'the FID probe (0 disables)')
 #################################
 # Model architecture choices
 # For our paper, we kept "flow_model_type" as nonLinearHeatDiffusion2
@@ -240,24 +278,18 @@ parser.add_argument('--use_ema', action='store_true', help='Use EMA for training
 parser.add_argument('--ema_decay', type=float, default=0.9999, help='EMA decay factor')
 
 parser.add_argument('--use_pretrained', action='store_true', help='Use EMA for training parameters', default=True)
-parser.add_argument('--pretrained_model_path', type=str, default="/data/shahriar/models/LSUN_Bedrooms/models/PreTrainedModels/LFM_dit_LSUN_Bedrooms_256/LFM_dit_LSUN_Bedrooms_model_550.pth",
-                    choices=["/data/shahriar/models/LSUN_Bedrooms/models/PreTrainedModels/LFM_dit_LSUN_Bedrooms_256/LFM_dit_LSUN_Bedrooms_model_550.pth", 
-                             "/data/shahriar/models/FFHQ/HuggingFaceVAE/mse/DhariwalUNet_FromScratch/seed_0",
-                             "/home/shahriar/FlowMatchingPredCor/FFHQ/models/HuggingFaceVAE/mse/DhariwalUNet_FromScratch/seed_0",
-                              "/home/shahriar/FlowMatchingPredCor/FFHQ/models/PreTrainedModels/LFM_ADM_FFHQ_256/LFM_ADM_FFHQ_256_model_325.pth"
-                             , "/data/shahriar/models/CelebAHQ256/models/PretrainedModels/LFM_DiT_L2_CelebA_HQ_256/DiT_L2_CelebA256_model_475.pth",
-                              "/home/shahriar/FlowMatchingPredCor/LSUN_Bedrooms/models/PreTrainedModels/LFM_ADM_LSUN_Bedrooms_256/LFM_ADM_LSUN_Bedrooms_model_425.pth",
-                              "/home/shahriar/FlowMatchingPredCor/LSUN_Church/models/PreTrainedModels/LFM_ADM_LSUN_Church_256/LFM_ADM_LSUN_Church_256_model_425.pth", 
-                             "/home/shahriar/FlowMatchingPredCor/CelebA/models/PretrainedModels/LFM_ADM_CelebA_HQ_256/LFM_ADM_CelebA_HQ_256.pth",
-                              "/home/shahriar/FlowMatchingPredCor/CelebA/models/PretrainedModels/LFM_DiT_L2_CelebA_HQ_256/DiT_L2_CelebA256_model_475.pth"], 
-                    help='path to the pretrained model file')
+parser.add_argument('--pretrained_model_path', type=str,
+                    default="/data/shahriar/models/LSUN_Bedrooms/models/PreTrainedModels/LFM_dit_LSUN_Bedrooms_256/LFM_dit_LSUN_Bedrooms_model_550.pth",
+                    help='Path to the pretrained LFM checkpoint used to warm-start the reaction '
+                         'network. Ignored (and --use_pretrained disabled) when the file is absent.')
 
-parser.add_argument('--ffhq_pretrained_model_savepath', type=str, default="/home/shahriar/FlowMatchingPredCor/FFHQ/models/HuggingFaceVAE/mse/DhariwalUNet_FromScratch/seed_0", choices=["/home/shahriar/FlowMatchingPredCor/FFHQ/models/HuggingFaceVAE/mse/DhariwalUNet_FromScratch/seed_0", "/data/shahriar/models/FFHQ/HuggingFaceVAE/mse/DhariwalUNet_FromScratch/seed_0"])
+parser.add_argument('--ffhq_pretrained_model_savepath', type=str,
+                    default="/home/shahriar/FlowMatchingPredCor/FFHQ/models/HuggingFaceVAE/mse/DhariwalUNet_FromScratch/seed_0",
+                    help='Directory holding the FFHQ vel_net_best_fid.pt used as an ADM warm start')
 
-parser.add_argument('--adm_config_path', type=str, default="/home/shahriar/FlowMatchingPredCor/networks/adm_unet_config_ffhq.yaml", choices=["/home/shahriar/FlowMatchingPredCor/networks/adm_unet_config_ffhq.yaml",
-                                                                                                                                                       "/home/shahriar/FlowMatchingPredCor/networks/adm_unet_config_lsun_bedrooms.yaml",
-                                                                                                                                                     "/home/shahriar/FlowMatchingPredCor/networks/adm_unet_config_lsun_church.yaml", 
-                                                                                                                                                    '/home/shahriar/FlowMatchingPredCor/networks/adm_unet_config_celeba.yaml'])
+parser.add_argument('--adm_config_path', type=str,
+                    default="networks/adm_unet_config_ffhq.yaml",
+                    help='YAML describing the ADM/EDM reaction UNet (see networks/*.yaml)')
 
 parser.add_argument('--optimizer', type=str, default="AdamW", help='Whether to use AdamW or Adam to optimize during training')
 parser.add_argument('--checkFID_every', type=int, default=1, help="The number of epochs to calculate FID after, during training")
@@ -301,6 +333,134 @@ parser.add_argument('--diffusion_gps_channels', type=int, default=256, #128
 
 
 args = parser.parse_args()
+
+########################################################################
+# Dataset-aware post-processing of the CLI arguments.
+#
+# Everything below adapts *configuration* to the new datasets -- resolution,
+# adjacency/attention resolutions, pretrained-checkpoint availability.  The
+# velocity network, the diffusion/reaction blocks and the flow-matching
+# objective are untouched.
+########################################################################
+NEW_DATASETS = ('cifar10', 'imagenet', 'imagenet-lt')
+
+# The latent grid the flow model runs on is entirely determined by the VAE:
+# SD-VAE downsamples by 8, so image_size 256 -> 32x32 latents (the released
+# setting), 128 -> 16x16, and so on.
+if args.dataset in NEW_DATASETS:
+    args.latent_size = args.image_size // 8
+    args.latent_channels = 4
+
+    # UNet2 asserts that attention resolutions divide the feature map, and DiT
+    # patchifies the latent grid; clamp the configured attention resolutions so
+    # a smaller latent grid does not silently produce an unusable model.
+    def _clamp_attn(res, cap):
+        kept = tuple(sorted({r for r in res if r <= cap}, reverse=True))
+        return kept if kept else (cap,)
+
+    args.diffusion_UNet_attn_resolutions = _clamp_attn(
+        tuple(args.diffusion_UNet_attn_resolutions), args.latent_size)
+    args.reaction_UNet_attn_resolutions = _clamp_attn(
+        tuple(args.reaction_UNet_attn_resolutions), args.latent_size)
+
+    # There are no public GFM/LFM checkpoints for these datasets, so training
+    # starts from scratch unless the user explicitly points at one.
+    if args.use_pretrained and not (args.pretrained_model_path
+                                    and os.path.exists(args.pretrained_model_path)):
+        print(f"[setup] no pretrained checkpoint for '{args.dataset}' at "
+              f"{args.pretrained_model_path!r} -> training the reaction network "
+              f"from scratch (--use_pretrained disabled).")
+        args.use_pretrained = False
+
+    print(f"[setup] dataset={args.dataset} image_size={args.image_size} "
+          f"latents={args.latent_channels}x{args.latent_size}x{args.latent_size} "
+          f"attn(diff)={args.diffusion_UNet_attn_resolutions} "
+          f"attn(react)={args.reaction_UNet_attn_resolutions}")
+
+
+def validate_model_config(args):
+    """Refuse configurations the *unchanged* model cannot express.
+
+    Two constraints are baked into the released adjacency generators and cannot
+    be relaxed without editing the model, which is out of scope here:
+
+    1. ``adj_mode='attention'`` uses AdjGenerator_Attention_ASPP_Time, whose
+       fixed ``AvgPool2d(4, 4)`` and hard-coded ``out_channels * 8 * 8`` flatten
+       only line up for a 32x32 latent grid, i.e. --image_size 256. Any other
+       latent size raises a shape error deep inside the attention projection.
+       The other adjacency modes are resolution-agnostic.
+    2. ``adj_mode='gaussian'`` computes exp(-||xi-xj||^2 / 2T^2) over the full
+       flattened latent. At 4x32x32 the squared distances are in the thousands,
+       so every off-diagonal entry underflows to exactly 0, the graph gradient's
+       sqrt(A) then has an infinite derivative, and training produces NaNs.
+    """
+    if args.adj_mode == 'attention' and args.latent_size != 32:
+        raise SystemExit(
+            f"\n[config error] --adj_mode attention requires a 32x32 latent grid "
+            f"(--image_size 256), but --image_size {args.image_size} gives "
+            f"{args.latent_size}x{args.latent_size}.\n"
+            f"The attention adjacency generator pools by a fixed factor of 4 and "
+            f"flattens a hard-coded 8x8 map, so it only accepts latent_size=32.\n"
+            f"Either use --image_size 256, or pick a resolution-agnostic "
+            f"adjacency: --adj_mode cosine | knn.\n")
+    if args.adj_mode == 'gaussian':
+        print("\n[config warning] --adj_mode gaussian is numerically degenerate on "
+              "latents of this dimensionality: the Gaussian kernel underflows to 0 "
+              "and the graph gradient's sqrt(A) produces NaNs. Prefer "
+              "--adj_mode attention (at --image_size 256), cosine or knn.\n")
+
+
+def validate_device(args):
+    """Fail early and legibly on an unusable --device.
+
+    The released default is cuda:1, which on a single-GPU machine surfaces as
+    'CUDA error: invalid device ordinal' from somewhere deep inside model
+    construction. Check it here instead.
+    """
+    dev = str(args.device)
+    if not dev.startswith("cuda"):
+        print(f"[setup] device={dev} (CPU: expect this to be very slow)")
+        return
+    if not torch.cuda.is_available():
+        raise SystemExit(
+            f"\n[config error] --device {dev} requested but torch reports no "
+            f"CUDA device (torch {torch.__version__}).\n"
+            f"Install a CUDA build of PyTorch, or pass --device cpu (very slow, "
+            f"only useful for smoke tests).\n")
+    n = torch.cuda.device_count()
+    idx = int(dev.split(":")[1]) if ":" in dev else 0
+    if idx >= n:
+        raise SystemExit(
+            f"\n[config error] --device {dev} requested but this machine has "
+            f"{n} CUDA device(s) (valid: cuda:0..cuda:{n - 1}).\n"
+            f"Note the repository default is cuda:1; pass --device cuda:0 on a "
+            f"single-GPU machine.\n")
+    props = torch.cuda.get_device_properties(idx)
+    print(f"[setup] device={dev} -> {props.name}, "
+          f"{props.total_memory / 1e9:.1f} GB")
+
+
+validate_model_config(args)
+validate_device(args)
+
+# 'none' disables the (expensive) in-training FID probe, which requires
+# pre-built clean-fid statistics to exist.
+if isinstance(args.cleanfid_dataset_name, str) and \
+        args.cleanfid_dataset_name.lower() in ('none', 'null', ''):
+    args.cleanfid_dataset_name = None
+
+
+def unpack_batch(batch):
+    """Return (x1, y) from a 2- or 3-tuple batch.
+
+    The original loaders yield ``(x0, x1)``; the CIFAR-10 / ImageNet /
+    ImageNet-LT loaders additionally yield the class label.  Labels are carried
+    through but not consumed by the unconditional flow objective below.
+    """
+    if len(batch) == 3:
+        return batch[1], batch[2]
+    return batch[1], None
+
 
 # dec = torch.load(
 #     os.path.join(args.model_savepath, 'hf_decoder_wrapper.pt'),
@@ -360,12 +520,31 @@ if args.use_wandb:
     # wandb.init(project="CelebA-HQ-256", config=vars(args), name=exp_name)
     # wandb.init(project="LSUN-Church-256", config=vars(args), name=exp_name)
     # wandb.define_metric("avg_loss_epoch", step_metric="epoch")
-    wandb.init(project="LSUN-Bedrooms-256", config=vars(args), name=exp_name)
+    _default_projects = {
+        'cifar10': 'GFM-CIFAR10',
+        'imagenet': f'GFM-ImageNet-{args.image_size}',
+        'imagenet-lt': f'GFM-ImageNet-LT-{args.image_size}',
+    }
+    wandb_project = args.wandb_project or _default_projects.get(
+        args.dataset, "LSUN-Bedrooms-256")
+    wandb.init(project=wandb_project, config=vars(args), name=exp_name)
     # wandb.init(project="FFHQ-256", config=vars(args), name=exp_name)
 
 # Create directories
 os.makedirs(args.model_savepath, exist_ok=True)
 os.makedirs(args.image_savepath, exist_ok=True)
+
+# Offline mirror of the training curves (loss / diffusion / reaction / FID).
+if args.csv_log:
+    from utils.loss_logger import CSVLossLogger
+    csv_logger = CSVLossLogger(args.model_savepath,
+                               log_every_steps=args.log_every_steps,
+                               resume=args.retrain_flow_network)
+    with open(os.path.join(args.model_savepath, 'run_config.json'), 'w') as _f:
+        import json as _json
+        _json.dump(vars(args), _f, indent=2, default=str)
+else:
+    csv_logger = None
 
 # Add this to debug your VAE behavior
 def diagnose_vae(enc, dec, dataloader, num_samples=5):
@@ -376,7 +555,7 @@ def diagnose_vae(enc, dec, dataloader, num_samples=5):
     
     # Get a batch of images
     data_iter = iter(dataloader)
-    x0, x1 = next(data_iter)
+    x1 = next(data_iter)[1]
     x1 = x1[:num_samples].to(args.device)
     
     # Check input range
@@ -422,7 +601,7 @@ def generate_vae_reconstructions(enc, dec, dataloader, num_samples=10, save_path
     
     # Get a batch of images
     data_iter = iter(dataloader)
-    x0, x1 = next(data_iter)
+    x1 = next(data_iter)[1]
     x1 = x1[:num_samples].to(args.device)
     
     # If using pre-encoded data, x1 is already the latent vector
@@ -554,15 +733,15 @@ if args.train_flow:
         
         elif args.diffusion_network == 'dit':
             from networks.DiT import DiT_XS_2
-            diffusion_network = DiT_XS_2(img_resolution=32, in_channels=args.latent_channels, num_classes=1, label_dropout=0.0, learn_sigma=False).to(args.device)
+            diffusion_network = DiT_XS_2(img_resolution=args.latent_size, in_channels=args.latent_channels, num_classes=1, label_dropout=0.0, learn_sigma=False).to(args.device)
 
         elif args.diffusion_network == 'gps':
             print(f"Diffusion network: {args.diffusion_network} !!")
             from networks.GPS import GPSDiffusion, GPSDiffusion2
             diffusion_network = GPSDiffusion2(
                 in_channels    = args.latent_channels,
-                H              = 32,
-                W              = 32,
+                H              = args.latent_size,
+                W              = args.latent_size,
                 hidden_dim     = args.diffusion_gps_channels,
                 pe_dim         = args.diffusion_pe_dim,
                 walk_length    = args.diffusion_walk_length,
@@ -581,7 +760,7 @@ if args.train_flow:
                 
                 N1_net = UNet2(
                 input_channels=args.latent_channels,
-                input_height=32,
+                input_height=args.latent_size,
                 ch=args.diffusion_UNet_channels,
                 output_channels=args.latent_channels,
                 ch_mult=args.diffusion_UNet_ch_mult,
@@ -592,7 +771,7 @@ if args.train_flow:
 
                 N2_net = UNet2(
                 input_channels=args.latent_channels,
-                input_height=32,
+                input_height=args.latent_size,
                 ch=args.diffusion_UNet_channels,
                 output_channels=args.latent_channels,
                 ch_mult=args.diffusion_UNet_ch_mult,
@@ -622,7 +801,7 @@ if args.train_flow:
         else:
             diffusion_network = UNet2(
                         input_channels=args.latent_channels,
-                        input_height=32,
+                        input_height=args.latent_size,
                         ch=args.diffusion_UNet_channels,
                         output_channels=args.latent_channels,
                         ch_mult=args.diffusion_UNet_ch_mult,
@@ -637,17 +816,17 @@ if args.train_flow:
                 if args.diffusion == True:
                     from networks.DiT import DiT_XS_2, DiT_B_2
                     # base_model = DiT_B_2(img_resolution=32, in_channels=args.latent_channels, num_classes=1, label_dropout=0.0, learn_sigma=False).to(args.device) #8 for previous VAE, 32 for current
-                    base_model = DiT_B_2(img_resolution=32, in_channels=args.latent_channels, num_classes=1, label_dropout=0.0, learn_sigma=False).to(args.device)
+                    base_model = DiT_B_2(img_resolution=args.latent_size, in_channels=args.latent_channels, num_classes=1, label_dropout=0.0, learn_sigma=False).to(args.device)
                 else: 
                     # load bigger model if no diffusion
                     # wondering what network 
                     from networks.DiT import DiT_XS_2_noDiffusion, DiT_M_2_noDiffusion
-                    base_model = DiT_M_2_noDiffusion(img_resolution=32, in_channels=args.latent_channels, num_classes=1, label_dropout=0.0, learn_sigma=False).to(args.device)
+                    base_model = DiT_M_2_noDiffusion(img_resolution=args.latent_size, in_channels=args.latent_channels, num_classes=1, label_dropout=0.0, learn_sigma=False).to(args.device)
             
             elif args.base_model == 'pnpUNet':
                 base_model = UNet2(
                             input_channels=args.latent_channels,
-                            input_height=32,
+                            input_height=args.latent_size,
                             ch=args.reaction_UNet_channels,
                             output_channels=args.latent_channels,
                             ch_mult=args.reaction_UNet_ch_mult,
@@ -655,11 +834,36 @@ if args.train_flow:
                             attn_resolutions= args.reaction_UNet_attn_resolutions, #(32,16) default for AFHQ-Cat and first DiT celeba-256 run
                             dropout=0.0, #0.0, 0.1
                             resamp_with_conv=True).to(args.device)
+            elif args.base_model == 'adm':
+                # From-scratch ADM/EDM reaction network -- needed for the new
+                # datasets, which have no released LFM checkpoint to warm-start
+                # from.  Same loaders as the pretrained path, minus the weights.
+                config_path = args.adm_config_path
+                if not os.path.exists(config_path):
+                    raise FileNotFoundError(
+                        f"--adm_config_path {config_path!r} not found. Point it at an "
+                        "adm_unet_config_*.yaml describing the reaction UNet.")
+                if args.dataset in ('lsun_bedrooms', 'ffhq'):
+                    base_model, _ = load_edm_unet(config_path, device=args.device, use_fp16=False)
+                else:
+                    base_model, _ = load_adm_unet(config_path, device=args.device,
+                                                  use_fp16=False, use_checkpoint=False)
+                print(f"Built ADM UNet from scratch with "
+                      f"{sum(p.numel() for p in base_model.parameters()):,} parameters.")
+            elif args.base_model == 'resnet':
+                base_model = resnet(args.latent_channels, args.latent_channels,
+                                    args.diffusion_resnet_channels,
+                                    num_layers=args.resnet_layers).to(args.device)
+            else:
+                raise ValueError(
+                    f"--base_model {args.base_model!r} has no from-scratch constructor. "
+                    "Use dit / pnpUNet / adm / resnet, or supply --use_pretrained "
+                    "with --pretrained_model_path.")
             # elif args.base_model == 'NCSNpp':
             #     base_model = NCSNpp(get_model_config_32x32())
         else:
             if args.base_model == 'dit':
-                base_model = load_pretrained_dit_model(args.pretrained_model_path, model_type="DiT-L/2", img_resolution=32, in_channels=args.latent_channels, device=args.device)
+                base_model = load_pretrained_dit_model(args.pretrained_model_path, model_type="DiT-L/2", img_resolution=args.latent_size, in_channels=args.latent_channels, device=args.device)
             elif args.base_model == 'adm':
                 if args.dataset == 'ffhq':
                     from utils.model_utils import OutputOnlyFirst
@@ -756,7 +960,11 @@ if args.train_flow:
         total_diffusion_term = 0.0
         total_reaction_term = 0.0
 
-        for batch_idx, (x0, x1) in enumerate(train_loader):
+        for batch_idx, batch in enumerate(train_loader):
+            # Loaders yield (x0, x1) or, for the class-labelled datasets,
+            # (x0, x1, y). The flow objective below is unconditional, so `y` is
+            # carried but unused -- see unpack_batch().
+            x1, y = unpack_batch(batch)
             # If you need different random values for each batch:
             if args.reproducible:
                 # You can further modify the seed with batch_idx if needed
@@ -859,7 +1067,7 @@ if args.train_flow:
                         has_grad = True
                 
                 if not has_grad:
-                    print("✓ Verified: No gradients flowing through VAE parameters")
+                    print("[OK] Verified: No gradients flowing through VAE parameters")
             ###################
 
             ###################
@@ -878,6 +1086,19 @@ if args.train_flow:
             # Increment the global step counter for each batch processed.
             global_step += 1
 
+            # Periodic checkpointing that does not depend on the FID probe.
+            # Without this, disabling in-training FID (--cleanfid_dataset_name
+            # none) would leave the run with no checkpoint until the very end.
+            if args.save_every_steps > 0 and global_step % args.save_every_steps == 0:
+                torch.save(vel_net, os.path.join(args.model_savepath, 'vel_net.pt'))
+                print(f"[ckpt] step {global_step} -> vel_net.pt")
+
+            # Offline CSV mirror of the training curves.
+            if csv_logger is not None:
+                csv_logger.log_step(global_step, epoch, loss.item(),
+                                    diffusion_term.item(), reaction_term.item(),
+                                    optimizer.param_groups[0]['lr'])
+
             # If step-based logging is enabled, log at the specified step frequency.
             if args.use_step_logging:
                 if global_step % args.log_every_steps == 0 and args.use_wandb:
@@ -888,11 +1109,11 @@ if args.train_flow:
                         "batch_loss": loss.item(),
                         "diffusion_term.abs().max()":diffusion_term.item(),
                         "reaction_term.abs().max()":reaction_term.item(),
-                        "lr": current_lr 
+                        "lr": current_lr
                     })
 
                 # If it’s time to run FID evaluation based on steps:
-                if global_step % args.checkFID_every_steps == 0:
+                if args.cleanfid_dataset_name and global_step % args.checkFID_every_steps == 0:
                     # Optionally clear cache and set seed before evaluation.
                     torch.cuda.empty_cache()
                     import gc
@@ -915,7 +1136,7 @@ if args.train_flow:
                             save_dir=args.temp_fid_comp_img_directory,
                             device=args.device,
                             latent_channels=args.latent_channels,
-                            latent_size=32,
+                            latent_size=args.latent_size,
                             nsteps=args.nsteps,
                             base_model=args.base_model,
                             int_method=args.int_method,
@@ -962,7 +1183,8 @@ if args.train_flow:
                     # Log the FID score.
                     if args.use_wandb:
                         wandb.log({"global_step": global_step, "FID": fid_true_vs_flow_trial})
-
+                    if csv_logger is not None:
+                        csv_logger.log_fid(global_step, epoch, fid_true_vs_flow_trial)
 
                     vel_net.train()
                     if args.use_ema:
@@ -983,7 +1205,7 @@ if args.train_flow:
         if early_stop:
             break
 
-        if not args.use_step_logging:
+        if not args.use_step_logging and args.cleanfid_dataset_name:
             if epoch % args.checkFID_every == 0:
                 # Clear memory
                 torch.cuda.empty_cache()
@@ -1004,7 +1226,7 @@ if args.train_flow:
                         time_convention = 'standard'
                     gen_img_save_dir, _ = generate_flow_matched_images(vel_net, decoder=dec, num_samples=args.num_img_for_FID_comp, batch_size=args.fid_batch_size, 
                                     save_dir=args.temp_fid_comp_img_directory, device=args.device, 
-                                    latent_channels=args.latent_channels, latent_size=32, nsteps=args.nsteps, 
+                                    latent_channels=args.latent_channels, latent_size=args.latent_size, nsteps=args.nsteps, 
                                     base_model=args.base_model, int_method=args.int_method, time_convention=time_convention, return_NFE=False)
                     
                     fid_true_vs_flow_trial = fid.compute_fid(
@@ -1078,7 +1300,13 @@ if args.train_flow:
                 f"FID ({args.num_img_for_FID_comp} gen. images, {args.int_method}, {args.nsteps} steps)": fid_true_vs_flow_trial,
                 "lr": current_lr
             })
-    
+
+        if csv_logger is not None:
+            csv_logger.log_epoch(
+                epoch + 1, global_step, avg_total_loss, avg_diffusion_term,
+                avg_reaction_term, current_lr,
+                fid=None if fid_true_vs_flow_trial == float('inf') else fid_true_vs_flow_trial)
+
         # Save the trained model directly to the specified save path
 
     # Save the trained model directly to the specified save path
