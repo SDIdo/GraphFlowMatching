@@ -1,0 +1,23 @@
+# This repo is edited on Windows (core.autocrlf=true) but runs on a Linux
+# cluster. A shell script checked out with CRLF fails there with the very
+# unhelpful:
+#
+#     bash: ./sbatch/submit.sh: /bin/bash^M: bad interpreter: No such file or directory
+#
+# Force LF in the working tree for everything that Linux has to execute or
+# parse literally. Deliberately narrow: no blanket `* text=auto eol=lf`, which
+# would rewrite every existing file's line endings and bury real diffs.
+*.sh      text eol=lf
+*.sbatch  text eol=lf
+*.slurm   text eol=lf
+
+# Keep binaries out of any line-ending conversion.
+*.pt      binary
+*.pth     binary
+*.ckpt    binary
+*.npz     binary
+*.npy     binary
+*.png     binary
+*.jpg     binary
+*.jpeg    binary
+*.pdf     binary

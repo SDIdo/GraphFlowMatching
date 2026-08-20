@@ -67,6 +67,15 @@ def parse_args(argv=None):
     p.add_argument("--num_reference_images", type=int, default=50000)
     p.add_argument("--num_eval_samples", type=int, default=10000)
     p.add_argument("--encode_limit", type=int, default=0)
+    p.add_argument("--imagenet_lt_split_file", default=None,
+                   help="Local ImageNet_LT_train.txt. Strongly preferred on a "
+                        "cluster: without it the loader tries to download the "
+                        "split, and on a compute node with no outbound network "
+                        "that silently falls back to a Pareto reconstruction, "
+                        "which is NOT the official split.")
+    p.add_argument("--no_pareto_fallback", action="store_true",
+                   help="Fail instead of reconstructing an ImageNet-LT split. "
+                        "Use this to guarantee the official split was used.")
 
     p.add_argument("--train_batch_size", type=int, default=64)
     p.add_argument("--flow_epochs", type=int, default=200)
@@ -93,6 +102,17 @@ def parse_args(argv=None):
                         "ablation sweeps so the expensive encode/reference "
                         "stages are done once.")
     return p.parse_args(argv)
+
+
+def lt_args(a):
+    """ImageNet-LT split options shared by the encode and reference stages."""
+    out = []
+    if a.dataset == "imagenet-lt":
+        if a.imagenet_lt_split_file:
+            out += ["--imagenet_lt_split_file", a.imagenet_lt_split_file]
+        if a.no_pareto_fallback:
+            out += ["--no_pareto_fallback"]
+    return out
 
 
 def main(argv=None):
@@ -137,6 +157,7 @@ def main(argv=None):
                "--device", a.device]
         if a.encode_limit:
             cmd += ["--limit", str(a.encode_limit)]
+        cmd += lt_args(a)
         run(cmd, a.dry_run)
 
     if "reference" in stages:
@@ -148,7 +169,7 @@ def main(argv=None):
              "--num_images", str(a.num_reference_images),
              "--num_workers", str(a.num_workers),
              "--device", a.device,
-             "--cleanfid_name", stats_name], a.dry_run)
+             "--cleanfid_name", stats_name] + lt_args(a), a.dry_run)
 
     if "train" in stages:
         cmd = [py, "train.py",

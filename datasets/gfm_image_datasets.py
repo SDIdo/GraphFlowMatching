@@ -96,6 +96,31 @@ class CIFAR10Dataset(Dataset):
 # --------------------------------------------------------------------------- #
 #  ImageNet (ILSVRC-2012)
 # --------------------------------------------------------------------------- #
+def check_dataset_root(root, what="ImageNet", env_var="DATA_ROOT_IMAGENET"):
+    """Fail with an actionable message rather than a bare OSError.
+
+    ImageNet is never downloaded automatically, so a wrong or unreadable path is
+    the single most common first-run failure. Diagnose it up front instead of
+    letting a PermissionError surface from inside a directory walk.
+    """
+    root = pathlib.Path(root)
+    hint = (f"\nSet the location explicitly, e.g.\n"
+            f"    {env_var}=/path/to/imagenet sbatch sbatch/run_gfm.sbatch ...\n"
+            f"or pass --data_root /path/to/imagenet directly.\n"
+            f"The directory must contain the wnid folders, either directly or "
+            f"under train/ (train/n01440764/..., train/n01443537/, ...).\n")
+    if not root.exists():
+        raise SystemExit(f"\n[data error] {what} root does not exist: {root}{hint}")
+    if not root.is_dir():
+        raise SystemExit(f"\n[data error] {what} root is not a directory: {root}{hint}")
+    if not os.access(root, os.R_OK | os.X_OK):
+        raise SystemExit(
+            f"\n[data error] {what} root is not readable by this user: {root}\n"
+            f"(os.access says no R_OK/X_OK -- check the mount and your group "
+            f"membership){hint}")
+    return root
+
+
 def _scan_imagenet_folder(root):
     """Return (samples, class_to_idx) for a wnid-per-subfolder ImageNet tree."""
     root = pathlib.Path(root)
@@ -194,15 +219,38 @@ LT_TRAIN_EXPECTED = {"num_images": 115846, "num_classes": 1000,
                      "max_per_class": 1280, "min_per_class": 5}
 
 
+def default_split_dir():
+    """A *writable* place to cache the ImageNet-LT split files.
+
+    Deliberately not the ImageNet root: on a cluster that is nearly always a
+    read-only shared mount, and writing there fails with a bare
+    ``PermissionError`` from deep inside dataset construction.
+    """
+    env = os.environ.get("GFM_CACHE_DIR")
+    if env:
+        return os.path.join(env, "imagenet_lt_splits")
+    return os.path.join(os.path.expanduser("~"), ".cache", "gfm",
+                        "imagenet_lt_splits")
+
+
 def download_lt_split(split, dst_dir):
     """Best-effort download of an official ImageNet-LT split file.
 
     Returns the local path on success, or ``None`` if every mirror failed.  The
     caller is expected to fall back to :func:`build_lt_split_pareto`.
     """
+    import tempfile
     import urllib.request
 
-    os.makedirs(dst_dir, exist_ok=True)
+    try:
+        os.makedirs(dst_dir, exist_ok=True)
+    except OSError as exc:
+        fallback = os.path.join(tempfile.gettempdir(), "gfm_imagenet_lt_splits")
+        print(f"[ImageNet-LT] cannot write to {dst_dir} ({exc}); "
+              f"caching the split file in {fallback} instead. Set GFM_CACHE_DIR "
+              f"to choose a different location.")
+        dst_dir = fallback
+        os.makedirs(dst_dir, exist_ok=True)
     dst = os.path.join(dst_dir, LT_SPLIT_FILES[split])
     if os.path.exists(dst) and os.path.getsize(dst) > 0:
         return dst
@@ -304,7 +352,9 @@ class ImageNetLTDataset(ImageNetDataset):
                  allow_pareto_fallback=True, pareto_seed=0,
                  full_split_subdir="train"):
         root = pathlib.Path(root_dir)
-        split_dir = split_dir or str(root / "ImageNet_LT_splits")
+        check_dataset_root(root, "ImageNet-LT", "DATA_ROOT_IMAGENET")
+        # NB: a writable cache, never `root` -- see default_split_dir().
+        split_dir = split_dir or default_split_dir()
 
         if split_file is None:
             split_file = download_lt_split(split, split_dir)
@@ -341,6 +391,42 @@ class ImageNetLTDataset(ImageNetDataset):
                          use_horizontal_flips=use_horizontal_flips,
                          return_label=return_label,
                          samples=samples, class_to_idx=class_to_idx)
+        self._verify_paths_resolve()
+
+    def _verify_paths_resolve(self, n_probe=5):
+        """Check the split file's paths actually resolve against ``root``.
+
+        The .txt lists paths like ``train/n01440764/n01440764_190.JPEG``, which
+        are relative to the directory holding ``train/`` -- not to the folder the
+        .txt itself sits in. Getting that wrong is the single easiest mistake to
+        make, and without this check it surfaces as a FileNotFoundError twenty
+        minutes into encoding.
+        """
+        if not self.samples:
+            raise SystemExit("\n[data error] ImageNet-LT split is empty.\n")
+        probe = self.samples[:n_probe]
+        missing = [rel for rel, _ in probe if not (self.root / rel).exists()]
+        if not missing:
+            return
+        example = missing[0]
+        guess = ""
+        # If the paths start with train/, the right root is whichever ancestor
+        # actually contains that directory.
+        head = example.split("/")[0]
+        for cand in (self.root, self.root.parent, self.root.parent.parent):
+            if (cand / head).is_dir():
+                guess = (f"\nDid you mean --data_root {cand} ? "
+                         f"({cand / head} exists.)\n")
+                break
+        raise SystemExit(
+            f"\n[data error] The ImageNet-LT split file lists images that do not "
+            f"exist under\n    {self.root}\n"
+            f"e.g. {example}\n"
+            f"     -> {self.root / example}\n"
+            f"The paths inside the .txt are relative to the directory that "
+            f"CONTAINS train/,\nnot to the folder holding the .txt files."
+            f"{guess}"
+            f"Split source: {getattr(self, 'split_source', 'unknown')}\n")
 
     def imbalance_report(self):
         counts = self.class_counts()
@@ -382,8 +468,15 @@ def build_image_dataset(name, root_dir, split="train", image_size=256,
                               return_label=return_label,
                               download=kwargs.get("download", True))
     if name in ("imagenet", "imnet", "imagenet-1k"):
+        check_dataset_root(root_dir, "ImageNet", "DATA_ROOT_IMAGENET")
         sub = kwargs.get("imagenet_subdir", split)
         root = os.path.join(root_dir, sub) if sub else root_dir
+        # Tolerate being pointed straight at the wnid folders instead of at the
+        # parent that holds train/ and val/.
+        if sub and not os.path.isdir(root):
+            print(f"[data] {root} not found; using {root_dir} directly "
+                  f"(looks like it already points at the {sub} split)")
+            root = root_dir
         return ImageNetDataset(root, image_size=image_size,
                                use_horizontal_flips=use_horizontal_flips,
                                return_label=return_label)

@@ -44,7 +44,8 @@
 #
 #   dataset : cifar10 | imagenet | imagenet-lt
 #   phase   : all (default) | warmup | encode | reference | train | evaluate
-#             | plot | paper | sweep
+#             | plot | paper | report | sweep
+#             (also any comma-separated subset, e.g. encode,reference,train)
 #
 # Examples
 #   sbatch sbatch/run_gfm.sbatch cifar10 warmup          # cache weights first
@@ -54,9 +55,37 @@
 #   sbatch sbatch/run_gfm.sbatch cifar10 sweep           # graph-correction ablation
 #   sbatch sbatch/run_gfm.sbatch cifar10 train --flow_epochs 400 --lr 1e-4
 #
+# RUNNING DATASETS IN PARALLEL
+#   The three datasets share nothing that matters: encoded latents, reference
+#   sets, checkpoints and results are all keyed by dataset. Submit them at the
+#   same time -- but stop before the aggregation stages, which are global and
+#   would overwrite each other:
+#
+#     sbatch sbatch/run_gfm.sbatch cifar10     warmup     # ONCE, first
+#     sbatch --time=36:00:00 sbatch/run_gfm.sbatch cifar10     encode,reference,train,evaluate
+#     sbatch --time=72:00:00 sbatch/run_gfm.sbatch imagenet-lt encode,reference,train,evaluate
+#     EPOCHS=25 sbatch --time=96:00:00 sbatch/run_gfm.sbatch imagenet encode,reference,train,evaluate
+#     # ...then once everything has finished:
+#     sbatch sbatch/run_gfm.sbatch cifar10 report
+#
+#   The 'report' phase scans WORK_DIR and rebuilds the figures and tables from
+#   every run it finds, so unfinished datasets simply show as '--' until they
+#   land. It needs no GPU, so it can also be run straight on a login node:
+#       bash sbatch/run_gfm.sbatch cifar10 report
+#
+#   Run 'warmup' first and let it finish: parallel cold starts would otherwise
+#   race each other downloading into the same HF_HOME/TORCH_HOME.
+#
+#   Do NOT run the plot/paper/report stages concurrently. They are global, not
+#   per-dataset: plot_training_curves.py always writes loss_curve/loss_terms/
+#   fid_curve under the same names, and build_paper.py rewrites results_table.tex
+#   with only the runs it was handed -- so two concurrent 'all' jobs would each
+#   erase the other's rows.
+#
 # Overridable via the environment:
 #   DATA_ROOT_CIFAR10, DATA_ROOT_IMAGENET, WORK_DIR, HF_HOME, TORCH_HOME,
-#   BATCH_SIZE, EPOCHS, EVAL_SAMPLES, REF_IMAGES, GFM_VARIANTS
+#   BATCH_SIZE, EPOCHS, EVAL_SAMPLES, REF_IMAGES, GFM_VARIANTS,
+#   IMAGENET_LT_SPLIT, GFM_CACHE_DIR
 #
 # -----------------------------------------------------------------------------
 # WALL-CLOCK BUDGET -- read this before submitting.
@@ -128,11 +157,72 @@ mkdir -p "$HF_HOME" "$TORCH_HOME"
 # Dataset roots. CIFAR-10 downloads itself; ImageNet must already be on disk
 # as <root>/train/n01440764/... and <root>/val/...
 DATA_ROOT_CIFAR10="${DATA_ROOT_CIFAR10:-$WORK_DIR/data/cifar10}"
-DATA_ROOT_IMAGENET="${DATA_ROOT_IMAGENET:-/datasets/imagenet}"
+# No default: ImageNet lives somewhere different on every cluster and is
+# never downloaded automatically. A wrong placeholder here just produces a
+# confusing PermissionError, so require it to be set.
+DATA_ROOT_IMAGENET="${DATA_ROOT_IMAGENET:-}"
 if [ "$DATASET" == "cifar10" ]; then
     DATA_ROOT="$DATA_ROOT_CIFAR10"
 else
     DATA_ROOT="$DATA_ROOT_IMAGENET"
+fi
+
+# ImageNet is never downloaded automatically. Check the path before doing
+# anything expensive -- otherwise the failure surfaces as a bare PermissionError
+# from inside a directory walk, after the job has already queued and started.
+if [ "$DATASET" != "cifar10" ] && [ "$PHASE" != "report" ] && [ "$PHASE" != "warmup" ]; then
+    if [ ! -d "$DATA_ROOT" ] || [ ! -r "$DATA_ROOT" ] || [ ! -x "$DATA_ROOT" ]; then
+        if [ -z "$DATA_ROOT" ]; then
+            echo "ERROR: DATA_ROOT_IMAGENET is not set, and ${DATASET} needs ImageNet." >&2
+        else
+            echo "ERROR: ImageNet root not readable: $DATA_ROOT" >&2
+        fi
+        echo >&2
+        echo "       Point it at the real location:" >&2
+        echo "         DATA_ROOT_IMAGENET=/path/to/imagenet \\" >&2
+        echo "           sbatch --time=72:00:00 sbatch/run_gfm.sbatch $DATASET $PHASE" >&2
+        echo >&2
+        echo "       It must contain the 1000 wnid folders, either directly or" >&2
+        echo "       under train/ .  To hunt for an existing copy on the cluster:" >&2
+        echo "         ls -d /datasets /data /scratch /storage /mnt/* 2>/dev/null" >&2
+        echo "         find / -maxdepth 4 -type d -name 'n01440764' 2>/dev/null | head" >&2
+        echo "       (n01440764 is the first ImageNet class; finding it locates the tree.)" >&2
+        exit 1
+    fi
+    echo "[data] ImageNet root OK: $DATA_ROOT"
+fi
+
+# Writable cache for the ImageNet-LT split file -- never the (read-only) dataset root.
+export GFM_CACHE_DIR="${GFM_CACHE_DIR:-$WORK_DIR/cache}"
+mkdir -p "$GFM_CACHE_DIR"
+
+# ImageNet-LT split list. Prefer a local copy: without one the loader tries to
+# download it, and on a compute node with no outbound network that quietly falls
+# back to a Pareto *reconstruction* -- same count profile, different file list,
+# so the numbers would not be comparable to published ImageNet-LT results.
+# Set IMAGENET_LT_SPLIT to override; otherwise look in the usual places.
+LT_EXTRA=()
+if [ "$DATASET" == "imagenet-lt" ] && [ "$PHASE" != "report" ] && [ "$PHASE" != "warmup" ]; then
+    if [ -z "${IMAGENET_LT_SPLIT:-}" ]; then
+        for c in "$DATA_ROOT/ImageNet_LT/ImageNet_LT_train.txt" \
+                 "$DATA_ROOT/ImageNet_LT_train.txt" \
+                 "$DATA_ROOT/../ImageNet_LT/ImageNet_LT_train.txt" \
+                 "$DATA_ROOT/splits/ImageNet_LT_train.txt"; do
+            if [ -r "$c" ]; then IMAGENET_LT_SPLIT="$c"; break; fi
+        done
+    fi
+    if [ -n "${IMAGENET_LT_SPLIT:-}" ] && [ -r "$IMAGENET_LT_SPLIT" ]; then
+        echo "[data] ImageNet-LT split (official): $IMAGENET_LT_SPLIT"
+        # --no_pareto_fallback: with a real split file in hand, a silent
+        # reconstruction can only mean something went wrong. Fail instead.
+        LT_EXTRA=(--imagenet_lt_split_file "$IMAGENET_LT_SPLIT" --no_pareto_fallback)
+    else
+        echo "[data] WARNING: no local ImageNet_LT_train.txt found." >&2
+        echo "       The loader will try to download it; if this node has no" >&2
+        echo "       network it falls back to a Pareto RECONSTRUCTION, which is" >&2
+        echo "       not the official split. Set IMAGENET_LT_SPLIT=/path/to/" >&2
+        echo "       ImageNet_LT_train.txt to be sure." >&2
+    fi
 fi
 
 BATCH_SIZE="${BATCH_SIZE:-64}"
@@ -147,10 +237,11 @@ NUM_WORKERS="${SLURM_CPUS_PER_TASK:-8}"
 DEVICE="cuda:0"
 
 # Fail loudly and early rather than 40 minutes into a queue slot.
-# `warmup` only downloads weights, so it is allowed to run somewhere without a
-# GPU (a login node); every other phase needs CUDA.
+# warmup (downloads weights) and report/plot/paper (pure CPU aggregation) are
+# allowed to run somewhere without a GPU, e.g. a login node. Everything else
+# needs CUDA.
 GFM_REQUIRE_CUDA=1
-[ "$PHASE" == "warmup" ] && GFM_REQUIRE_CUDA=0
+case "$PHASE" in warmup|report|plot|paper) GFM_REQUIRE_CUDA=0 ;; esac
 export GFM_REQUIRE_CUDA
 
 python - <<'PY' || exit 1
@@ -187,6 +278,7 @@ nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true
 COMMON=(
     --dataset "$DATASET"
     --data_root "$DATA_ROOT"
+    ${LT_EXTRA[@]+"${LT_EXTRA[@]}"}
     --work_dir "$WORK_DIR"
     --device "$DEVICE"
     --num_workers "$NUM_WORKERS"
@@ -221,6 +313,53 @@ build_feature_extractor(
 print("clean-fid inception cached")
 PY
     echo "warmup complete"
+
+elif [ "$PHASE" == "report" ]; then
+    # Aggregate EVERY finished run under $WORK_DIR into one figure set and one
+    # set of LaTeX tables.
+    #
+    # This exists because `plot` and `paper` are global, not per-dataset:
+    # plot_training_curves.py always writes loss_curve/loss_terms/fid_curve
+    # (same filenames whatever the dataset) and build_paper.py rewrites
+    # results_table.tex containing only the runs handed to it. Two dataset jobs
+    # running those stages concurrently would overwrite each other's output.
+    # So: run the per-dataset stages in parallel, then this once at the end.
+    echo "=================================================="
+    echo " COLLECTING RESULTS from ${WORK_DIR}"
+    echo "=================================================="
+    PLOT_ARGS=()
+    PAPER_ARGS=()
+    n_found=0
+    for d in "$WORK_DIR"/runs/*/models; do
+        [ -d "$d" ] || continue
+        v="$(basename "$(dirname "$d")")"
+        label="${v//__/-}"
+        res="$WORK_DIR/results/$v"
+        have_log=0; [ -s "$d/train_log_steps.csv" ] && have_log=1
+        have_res=0; [ -s "$res/metrics.json" ] && have_res=1
+        if [ "$have_log" -eq 0 ] && [ "$have_res" -eq 0 ]; then
+            continue
+        fi
+        echo "  ${label}: train-log=${have_log} metrics=${have_res}"
+        if [ "$have_log" -eq 1 ]; then
+            PLOT_ARGS+=(--run "${label}=${d}")
+        fi
+        PAPER_ARGS+=(--run "${label}=${d}")
+        if [ "$have_res" -eq 1 ]; then
+            PAPER_ARGS+=(--result "${label}=${res}")
+        fi
+        n_found=$((n_found + 1))
+    done
+
+    if [ "$n_found" -eq 0 ]; then
+        echo "nothing to report yet under ${WORK_DIR}/runs/*/models"
+        exit 0
+    fi
+    if [ "${#PLOT_ARGS[@]}" -gt 0 ]; then
+        python scripts/plot_training_curves.py "${PLOT_ARGS[@]}" --out_dir paper/figures
+    fi
+    python scripts/build_paper.py "${PAPER_ARGS[@]}"
+    echo "collected ${n_found} run(s) -- build the PDF with: cd paper && latexmk -pdf main.tex"
 
 elif [ "$PHASE" == "sweep" ]; then
     # Ablation of the graph correction -- the term the GFM paper adds. The

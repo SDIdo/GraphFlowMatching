@@ -215,18 +215,56 @@ rejects the whole job if one is stale (`Invalid node name specified`). Use the
 wrapper, which keeps only the names that actually exist:
 
 ```bash
-sbatch/submit.sh --check                      # audit names + GPU features
-sbatch/submit.sh --dry-run cifar10 warmup     # show the command
-sbatch/submit.sh --time=36:00:00 cifar10      # submit
+bash sbatch/submit.sh --check                 # audit names + GPU features
+bash sbatch/submit.sh --dry-run cifar10 warmup
+bash sbatch/submit.sh --time=36:00:00 cifar10 # submit
 ```
+
+Invoking it as `bash sbatch/submit.sh` always works. `./sbatch/submit.sh` needs
+the executable bit, which is recorded in git (mode 100755) but will not survive
+a copy from a Windows filesystem -- `chmod +x sbatch/submit.sh` on the cluster if
+you see `Permission denied`.
 
 Edit the list in `sbatch/submit.sh` (`WANT_EXCLUDE`), not in the job script.
 Plain `sbatch sbatch/run_gfm.sbatch ...` also works -- `--constraint` already
 pins the job to the four wanted GPU types, so the exclusion is belt-and-braces.
 
-Submit from the repo root. Point `DATA_ROOT_IMAGENET` at the ImageNet root and
-`WORK_DIR` at scratch; `HF_HOME`/`TORCH_HOME` default under `WORK_DIR` so model
-downloads do not hit your home quota. The job requests one GPU constrained to
+Submit from the repo root. `WORK_DIR` should point at scratch;
+`HF_HOME`/`TORCH_HOME`/`GFM_CACHE_DIR` default under it so downloads do not hit
+your home quota.
+
+**ImageNet is never downloaded automatically** and lives somewhere different on
+every cluster, so `DATA_ROOT_IMAGENET` has no default -- set it explicitly:
+
+```bash
+DATA_ROOT_IMAGENET=/path/to/imagenet   sbatch --time=72:00:00 sbatch/run_gfm.sbatch imagenet-lt
+```
+
+It must contain the 1000 wnid folders, directly or under `train/`. To locate an
+existing copy: `find / -maxdepth 4 -type d -name n01440764 2>/dev/null | head`
+(that is the first ImageNet class, so finding it locates the tree). The job
+checks the path is readable before doing anything expensive. CIFAR-10 needs
+none of this -- it downloads itself.
+
+**ImageNet-LT split file.** `DATA_ROOT_IMAGENET` is the *image* root; the split
+`.txt` files are a separate thing, listing paths like
+`train/n01440764/n01440764_190.JPEG` relative to that image root. The job
+auto-detects a local `ImageNet_LT_train.txt` in the usual places
+(`$DATA_ROOT/ImageNet_LT/`, `$DATA_ROOT/`, `$DATA_ROOT/../ImageNet_LT/`,
+`$DATA_ROOT/splits/`) and otherwise takes `IMAGENET_LT_SPLIT`:
+
+```bash
+DATA_ROOT_IMAGENET=/groups/eliasof_group/sananest/ImageNet   sbatch --time=72:00:00 sbatch/run_gfm.sbatch imagenet-lt
+```
+
+Using a local file matters: without one the loader tries to *download* the
+split, and on a compute node with no outbound network it falls back to a
+Pareto reconstruction -- same count profile, different file list, so the numbers
+would not be comparable to published ImageNet-LT results. When a local file is
+found the job also passes `--no_pareto_fallback`, so that reconstruction can
+never happen silently. The loader verifies the split against the published
+statistics (115,846 images / 1000 classes / 1280 head / 5 tail) and checks that
+its paths actually resolve under the image root before encoding starts. The job requests one GPU constrained to
 `rtx_3090|rtx_4090|rtx_6000|rtx_pro_6000` and always passes `--device cuda:0`,
 since Slurm remaps the allocated card to index 0.
 
@@ -257,6 +295,32 @@ python scripts/estimate_runtime.py --run work/runs/cifar10/models     --dataset 
 projects the full job and tells you how many epochs fit in one allocation.
 Resuming a timed-out job with `--retrain_flow_network` restores the weights only
 -- the optimizer state and cosine LR schedule restart -- so prefer one long job.
+
+**Running the three datasets in parallel.** They share nothing that matters --
+encoded latents, reference sets, checkpoints and results are all keyed by
+dataset. Submit them simultaneously, but stop before the aggregation stages:
+
+```bash
+sbatch sbatch/run_gfm.sbatch cifar10 warmup          # ONCE, let it finish first
+
+sbatch --time=36:00:00 sbatch/run_gfm.sbatch cifar10     encode,reference,train,evaluate
+sbatch --time=72:00:00 sbatch/run_gfm.sbatch imagenet-lt encode,reference,train,evaluate
+EPOCHS=25 sbatch --time=96:00:00 sbatch/run_gfm.sbatch imagenet encode,reference,train,evaluate
+
+# once they have all finished (no GPU needed, fine on a login node):
+bash sbatch/run_gfm.sbatch cifar10 report
+```
+
+`report` scans `WORK_DIR`, finds every run, and rebuilds the figures and tables
+from all of them at once; datasets that have not finished show as `--`.
+
+Two stages are *not* safe to run concurrently, which is why the parallel
+submissions above stop at `evaluate`: `plot` and `paper` are global rather than
+per-dataset. `plot_training_curves.py` always writes `loss_curve` /
+`loss_terms` / `fid_curve` under the same filenames, and `build_paper.py`
+rewrites `results_table.tex` containing only the runs handed to it -- so two
+concurrent `all` jobs would each erase the other's rows. Run `warmup` first too,
+or parallel cold starts race on the same `HF_HOME` download.
 
 The `sweep` phase runs encode/reference once, then trains and evaluates four
 variants (attention / cosine / kNN adjacency, plus a no-graph baseline) via
