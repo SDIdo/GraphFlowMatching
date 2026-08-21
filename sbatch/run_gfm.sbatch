@@ -209,13 +209,38 @@ DATA_ROOT_CIFAR10="${DATA_ROOT_CIFAR10:-$WORK_DIR/data/cifar10}"
 # never downloaded automatically. A wrong placeholder here just produces a
 # confusing PermissionError, so require it to be set.
 DATA_ROOT_IMAGENET="${DATA_ROOT_IMAGENET:-}"
-# ...but a root that already worked is remembered under WORK_DIR, so the second
-# and later submissions (imagenet-lt after imagenet, a re-run after a timeout)
-# do not have to repeat it on the command line.
+
+# Which stages actually open the raw image tree? Only the two that walk it:
+# encode (JPEG -> latents) and reference (JPEG -> the FID reference set). train
+# reads the encoded latents, evaluate reads the reference set, and plot/paper/
+# report read run directories -- none of them touch DATA_ROOT, so none of them
+# should be blocked on a path they never open.
+NEEDS_RAW=0
+case ",$PHASE," in
+    *,encode,*|*,reference,*|,all,|,sweep,) NEEDS_RAW=1 ;;
+esac
+
+SLUG="${DATASET//-/_}"
+# Where an explicit root is not given, two places remember one that worked:
+#   1. the memo this script writes after a successful check;
+#   2. "source_root" in the metadata.json that encode_new_datasets.py writes
+#      beside the latents -- so a tree that was encoded once stays findable even
+#      if the memo predates this script or WORK_DIR was rebuilt.
 IMAGENET_ROOT_MEMO="$WORK_DIR/.imagenet_root"
 if [ -z "$DATA_ROOT_IMAGENET" ] && [ -r "$IMAGENET_ROOT_MEMO" ]; then
     DATA_ROOT_IMAGENET="$(cat "$IMAGENET_ROOT_MEMO")"
-    echo "[data] DATA_ROOT_IMAGENET unset -> reusing remembered root: $DATA_ROOT_IMAGENET"
+    echo "[data] DATA_ROOT_IMAGENET unset -> remembered root: $DATA_ROOT_IMAGENET"
+fi
+if [ -z "$DATA_ROOT_IMAGENET" ] && [ "$DATASET" != "cifar10" ]; then
+    for _meta in "$WORK_DIR"/encoded/"$SLUG"_*/metadata.json; do
+        [ -r "$_meta" ] || continue
+        _root="$(python -c 'import json,sys; print(json.load(open(sys.argv[1])).get("source_root",""))' "$_meta" 2>/dev/null || true)"
+        if [ -n "$_root" ] && [ -d "$_root" ]; then
+            DATA_ROOT_IMAGENET="$_root"
+            echo "[data] recovered ImageNet root from $_meta: $DATA_ROOT_IMAGENET"
+            break
+        fi
+    done
 fi
 if [ "$DATASET" == "cifar10" ]; then
     DATA_ROOT="$DATA_ROOT_CIFAR10"
@@ -226,18 +251,25 @@ fi
 # ImageNet is never downloaded automatically. Check the path before doing
 # anything expensive -- otherwise the failure surfaces as a bare PermissionError
 # from inside a directory walk, after the job has already queued and started.
-if [ "$DATASET" != "cifar10" ] && [ "$PHASE" != "report" ] && [ "$PHASE" != "warmup" ]; then
+if [ "$DATASET" != "cifar10" ] && [ "$NEEDS_RAW" -eq 1 ]; then
     if [ ! -d "$DATA_ROOT" ] || [ ! -r "$DATA_ROOT" ] || [ ! -x "$DATA_ROOT" ]; then
         if [ -z "$DATA_ROOT" ]; then
-            echo "ERROR: DATA_ROOT_IMAGENET is not set, and ${DATASET} needs ImageNet." >&2
+            echo "ERROR: DATA_ROOT_IMAGENET is not set, and phase '$PHASE' reads the" >&2
+            echo "       raw ImageNet images (encode and reference do; train," >&2
+            echo "       evaluate, plot, paper and report do not)." >&2
         else
             echo "ERROR: ImageNet root not readable: $DATA_ROOT" >&2
         fi
         echo >&2
-        echo "       Point it at the real location (it is then remembered in" >&2
-        echo "       $IMAGENET_ROOT_MEMO for later submissions):" >&2
+        echo "       If the latents and the reference set already exist, skip those" >&2
+        echo "       two stages and no root is needed at all:" >&2
+        echo "         sbatch --time=72:00:00 sbatch/run_gfm.sbatch $DATASET train,evaluate" >&2
+        echo >&2
+        echo "       Otherwise point it at the real location (it is then remembered" >&2
+        echo "       in $IMAGENET_ROOT_MEMO for later submissions):" >&2
         echo "         DATA_ROOT_IMAGENET=/path/to/imagenet \\" >&2
         echo "           sbatch --time=72:00:00 sbatch/run_gfm.sbatch $DATASET $PHASE" >&2
+        echo "       or put it in sbatch/site.env once (see sbatch/site.env.example)." >&2
         echo >&2
         echo "       It must hold EITHER the 1000 wnid folders (directly or under" >&2
         echo "       train/) OR HuggingFace parquet shards (*.parquet, directly or" >&2
@@ -250,6 +282,11 @@ if [ "$DATASET" != "cifar10" ] && [ "$PHASE" != "report" ] && [ "$PHASE" != "war
     fi
     echo "[data] ImageNet root OK: $DATA_ROOT"
     printf '%s' "$DATA_ROOT" > "$IMAGENET_ROOT_MEMO" 2>/dev/null || true
+elif [ "$DATASET" != "cifar10" ]; then
+    echo "[data] phase '$PHASE' does not read raw images -- ImageNet root not required"
+    echo "       (train uses $WORK_DIR/encoded/${SLUG}_*, evaluate uses"
+    echo "        $WORK_DIR/reference/${SLUG}_*; build those with the encode and"
+    echo "        reference stages, which do need the root)"
 fi
 
 # Writable cache for the ImageNet-LT split file -- never the (read-only) dataset root.
@@ -262,7 +299,7 @@ mkdir -p "$GFM_CACHE_DIR"
 # so the numbers would not be comparable to published ImageNet-LT results.
 # Set IMAGENET_LT_SPLIT to override; otherwise look in the usual places.
 LT_EXTRA=()
-if [ "$DATASET" == "imagenet-lt" ] && [ "$PHASE" != "report" ] && [ "$PHASE" != "warmup" ]; then
+if [ "$DATASET" == "imagenet-lt" ] && [ "$NEEDS_RAW" -eq 1 ]; then
     if [ -z "${IMAGENET_LT_SPLIT:-}" ]; then
         for c in "$DATA_ROOT/ImageNet_LT/ImageNet_LT_train.txt" \
                  "$DATA_ROOT/ImageNet_LT_train.txt" \
@@ -285,21 +322,32 @@ if [ "$DATASET" == "imagenet-lt" ] && [ "$PHASE" != "report" ] && [ "$PHASE" != 
     fi
 fi
 
+# --- what card did we actually get? ------------------------------------------
+# Read once, used twice: the micro-batch heuristic wants the memory figure, and
+# the CUDA preflight below wants the name and driver version to tell "no GPU in
+# this allocation" apart from "GPU present but CUDA will not start on it".
+# nvidia-smi reports only the GPUs allocated to this job, so head -n1 is the
+# card we will train on. '|| true': with pipefail a missing nvidia-smi (login
+# node, CPU partition) would otherwise take the script down through set -e.
+GPU_INFO="$(nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader,nounits 2>/dev/null | head -n1 | tr -d '\r' || true)"
+GPU_NAME="$(printf '%s' "$GPU_INFO" | cut -d, -f1 | sed 's/^[[:space:]]*//')"
+GPU_DRIVER="$(printf '%s' "$GPU_INFO" | cut -d, -f2 | tr -d '[:space:]')"
+GPU_MEM_MIB="$(printf '%s' "$GPU_INFO" | cut -d, -f3 | tr -d '[:space:]')"
+if [ -n "$GPU_INFO" ]; then
+    echo "[gpu] ${GPU_NAME}, driver ${GPU_DRIVER}, ${GPU_MEM_MIB} MiB"
+else
+    echo "[gpu] nvidia-smi reported nothing (no GPU in this allocation, or no driver)"
+fi
+
 # Effective batch (what the optimizer sees) and the micro-batch that actually
 # has to fit in VRAM. See the GPU MEMORY section at the top.
 BATCH_SIZE="${BATCH_SIZE:-64}"
 MICRO_BATCH="${MICRO_BATCH:-auto}"
 
 if [ "$MICRO_BATCH" == "auto" ]; then
-    # nvidia-smi reports only the GPUs allocated to this job, so head -n1 is the
-    # card we will actually train on. On a node without one (warmup, report) the
-    # query fails and we simply leave the batch whole.
-    # '|| true': with pipefail a missing nvidia-smi (login node, CPU partition)
-    # would otherwise take the whole script down through set -e.
-    GPU_MEM_MIB="$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -n1 | tr -d '[:space:]' || true)"
     case "${GPU_MEM_MIB:-}" in
         ''|*[!0-9]*)
-            echo "[gpu] no usable nvidia-smi reading -> keeping the batch whole"
+            echo "[gpu] no usable memory reading -> keeping the batch whole"
             MICRO_BATCH="$BATCH_SIZE" ;;
         *)
             # ~2.5 GB fixed (weights, grads, AdamW moments) + ~0.33 GB per
@@ -353,7 +401,19 @@ GFM_REQUIRE_CUDA=1
 case "$PHASE" in warmup|report|plot|paper) GFM_REQUIRE_CUDA=0 ;; esac
 export GFM_REQUIRE_CUDA
 
-python - <<'PY' || exit 1
+# The banner goes BEFORE the preflight: when the preflight is what fails, the
+# log still has to say which node and which card it failed on.
+echo "=================================================="
+echo " host=$(hostname)  job=${SLURM_JOB_ID:-none}"
+echo " dataset=${DATASET}  phase=${PHASE}  extra_args=$*"
+echo " data_root=${DATA_ROOT}"
+echo " work_dir=${WORK_DIR}"
+echo " workers=${NUM_WORKERS}  epochs=${EPOCHS}"
+echo " batch=${BATCH_SIZE} (micro ${MICRO_BATCH} x accum ${GRAD_ACCUM})"
+echo " gpu=${GPU_INFO:-none}"
+echo "=================================================="
+
+if ! python - <<'PY'
 import importlib.util, os, sys  # NB: bare "import importlib" hides .util
 missing = [m for m in ("torch", "torchvision", "diffusers", "timm", "einops",
                        "omegaconf", "torchdiffeq", "cleanfid", "scipy",
@@ -367,23 +427,55 @@ if missing:
 import torch
 have = torch.cuda.is_available()
 if os.environ.get("GFM_REQUIRE_CUDA") == "1" and not have:
-    print(f"ERROR: torch {torch.__version__} reports no CUDA device.", file=sys.stderr)
-    print("       Either the allocation has no GPU, or this is a CPU-only "
-          "wheel -- reinstall with the --extra-index-url above.", file=sys.stderr)
+    # Two very different failures hide behind "no CUDA device". Say which one:
+    # a CPU-only wheel is ours to fix, a driver that refuses to initialise is
+    # the node's -- and the shell below adds the evidence either way.
+    if torch.version.cuda is None:
+        print(f"ERROR: torch {torch.__version__} is a CPU-ONLY build "
+              f"(torch.version.cuda is None).", file=sys.stderr)
+        print("       Reinstall with the --extra-index-url above.", file=sys.stderr)
+    else:
+        print(f"ERROR: torch {torch.__version__} is built for CUDA "
+              f"{torch.version.cuda} but cannot initialise any GPU.",
+              file=sys.stderr)
+        print("       The wheel is fine; CUDA itself refused to start.",
+              file=sys.stderr)
     sys.exit(1)
 print(f"torch {torch.__version__}  cuda {torch.version.cuda}  "
       f"devices {torch.cuda.device_count() if have else 0}")
 PY
-
-echo "=================================================="
-echo " host=$(hostname)  job=${SLURM_JOB_ID:-none}"
-echo " dataset=${DATASET}  phase=${PHASE}  extra_args=$*"
-echo " data_root=${DATA_ROOT}"
-echo " work_dir=${WORK_DIR}"
-echo " workers=${NUM_WORKERS}  epochs=${EPOCHS}"
-echo " batch=${BATCH_SIZE} (micro ${MICRO_BATCH} x accum ${GRAD_ACCUM})"
-echo "=================================================="
-nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true
+then
+    NODE="${SLURMD_NODENAME:-$(hostname)}"
+    {
+        echo "--- CUDA diagnostics -------------------------------------------"
+        echo " node=${NODE}  job=${SLURM_JOB_ID:-none}"
+        echo " CUDA_VISIBLE_DEVICES='${CUDA_VISIBLE_DEVICES:-<unset>}'"
+        echo " SLURM_JOB_GPUS='${SLURM_JOB_GPUS:-<unset>}'  GPU_DEVICE_ORDINAL='${GPU_DEVICE_ORDINAL:-<unset>}'"
+        echo " nvidia-smi: ${GPU_INFO:-<nothing>}"
+        echo " /dev nodes: $(ls -1 /dev/nvidia* 2>/dev/null | tr '\n' ' ' || true)"
+        if [ -n "$GPU_INFO" ]; then
+            cat <<MSG
+ nvidia-smi sees the card, so it is there -- but CUDA will not initialise on it
+ ("CUDA unknown error", "Setting the available devices to be zero"). That is a
+ node-level fault, not a problem with this repo or the venv: a wedged driver, a
+ missing /dev/nvidia-uvm, or a driver too old for the cu124 wheels (torch 2.6
+ +cu124 needs driver >= 525; this node reports ${GPU_DRIVER:-unknown}).
+ Nothing to fix in the job. Resubmit somewhere else:
+     sbatch --exclude=${NODE} sbatch/run_gfm.sbatch ${DATASET} ${PHASE}
+ and add ${NODE} to WANT_EXCLUDE in sbatch/submit.sh so it stays out of the pool.
+MSG
+        else
+            cat <<MSG
+ No GPU is visible at all, so the allocation never had one. Check that the
+ submission kept --gres=gpu:1 and --partition=gpu (both are #SBATCH directives
+ in this script, so plain 'sbatch sbatch/run_gfm.sbatch ...' has them), and that
+ the node really is a GPU node: scontrol show node ${NODE}
+MSG
+        fi
+        echo "----------------------------------------------------------------"
+    } >&2
+    exit 1
+fi
 
 COMMON=(
     --dataset "$DATASET"

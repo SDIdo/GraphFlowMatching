@@ -195,6 +195,23 @@ Every stage runs on GPU and takes `--device` (`train.py`,
   rest of the run uses, so `make_reference_set.py` passes `--device` through
   explicitly (and falls back to CPU when CUDA is unavailable).
 
+**"torch reports no CUDA device".** Three different problems produce that line,
+so the Slurm preflight now separates them and prints the evidence (node,
+`CUDA_VISIBLE_DEVICES`, `SLURM_JOB_GPUS`, `/dev/nvidia*`, and what `nvidia-smi`
+sees) before exiting:
+
+- a **CPU-only wheel** (`torch.version.cuda is None`) -- reinstall from the
+  cu124 index;
+- **no GPU in the allocation** -- `nvidia-smi` sees nothing either; check
+  `--gres`/`--partition`;
+- **a GPU that CUDA cannot initialise** -- `nvidia-smi` lists the card but torch
+  warns `CUDA initialization: CUDA unknown error ... Setting the available
+  devices to be zero`. That is a broken node (wedged driver, missing
+  `/dev/nvidia-uvm`, or a driver older than 525, which the cu124 wheels
+  require), not a repo or venv problem. Resubmit elsewhere with
+  `sbatch --exclude=<node> ...` and add the node to `WANT_EXCLUDE` in
+  `sbatch/submit.sh`.
+
 ### Running on a Slurm cluster
 
 ```bash
@@ -246,10 +263,22 @@ existing copy: `find / -maxdepth 4 -type d -name n01440764 2>/dev/null | head`
 checks the path is readable before doing anything expensive. CIFAR-10 needs
 none of this -- it downloads itself.
 
-A root that passed that check is remembered in `$WORK_DIR/.imagenet_root`, so
-later submissions (`imagenet-lt` after `imagenet`, a re-run after a timeout) can
-omit `DATA_ROOT_IMAGENET` and still find the data. An explicit value always
-wins; `sbatch/site.env` is the place to make it permanent.
+**Only `encode` and `reference` read the raw tree.** `train` works off the
+encoded latents, `evaluate` off the pre-built reference set, and
+`plot`/`paper`/`report` off the run directories -- so once the latents exist,
+
+```bash
+sbatch --time=96:00:00 sbatch/run_gfm.sbatch imagenet train,evaluate
+```
+
+needs no `DATA_ROOT_IMAGENET` at all, and the job no longer refuses to start
+without one. `all` and `sweep` include `encode`/`reference`, so they still do.
+
+When the root is not given, two places are consulted before giving up: the
+`$WORK_DIR/.imagenet_root` memo written after a successful check, and
+`source_root` in the `metadata.json` that `encode_new_datasets.py` writes beside
+the latents -- so a tree that was encoded once stays findable. An explicit value
+always wins; `sbatch/site.env` is the place to make it permanent.
 
 **ImageNet as parquet shards.** If `DATA_ROOT_IMAGENET` holds HuggingFace
 parquet shards (`data/train-00000-of-00294.parquet`, ...) instead of a JPEG

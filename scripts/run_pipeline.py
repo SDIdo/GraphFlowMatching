@@ -53,8 +53,11 @@ def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--dataset", required=True, choices=list(DEFAULTS))
-    p.add_argument("--data_root", required=True,
-                   help="CIFAR-10 download dir, or the ImageNet root")
+    p.add_argument("--data_root", default="",
+                   help="CIFAR-10 download dir, or the ImageNet root. Only the "
+                        "encode and reference stages read it; train works off "
+                        "the encoded latents and evaluate off the reference set, "
+                        "so those can run without it.")
     p.add_argument("--work_dir", default="./work",
                    help="Root for encoded latents, reference sets, runs, results")
     p.add_argument("--stages", default=",".join(ALL_STAGES),
@@ -148,6 +151,16 @@ def main(argv=None):
     for s in stages:
         if s not in ALL_STAGES:
             raise SystemExit(f"unknown stage {s!r}; choose from {ALL_STAGES}")
+
+    # Fail here rather than inside a directory walk two stages later.
+    needs_raw = [s for s in stages if s in ("encode", "reference")]
+    if needs_raw and not a.data_root:
+        raise SystemExit(
+            f"""--data_root is required by these stages, which read the raw
+images: {', '.join(needs_raw)}.
+train reads <work_dir>/encoded and evaluate reads <work_dir>/reference, so
+those two run without it.""")
+
     py = sys.executable
 
     print(f"[pipeline] dataset={a.dataset} image_size={image_size} "
