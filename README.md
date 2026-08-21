@@ -424,8 +424,44 @@ python scripts/estimate_runtime.py --run work/runs/cifar10/models     --dataset 
 ```
 
 projects the full job and tells you how many epochs fit in one allocation.
-Resuming a timed-out job with `--retrain_flow_network` restores the weights only
--- the optimizer state and cosine LR schedule restart -- so prefer one long job.
+
+### Runs longer than one allocation
+
+`train.py` writes `train_state.pt` next to the checkpoints -- model, AdamW
+moments, cosine LR schedule, epoch and step -- every `--state_every_steps`
+(default 2000) and at every epoch boundary, with an atomic `tmp` + `os.replace`
+so a job killed mid-write cannot corrupt it. `--resume auto` (the default) picks
+it up, so an interrupted run continues instead of restarting; resuming rewinds
+to the start of the epoch that was in progress, repeating at most one epoch.
+
+This is what `--retrain_flow_network` does *not* do: it reloads weights only, so
+the optimizer moments and the LR schedule restart each time and N chained jobs
+behave differently from one job of the same length.
+
+So when the run is longer than the cluster's wall-clock cap, chain it:
+
+```bash
+# check the real cap first -- one long job always beats a chain
+sinfo -o '%20P %10l %10L'                 # partition MaxTime / DefaultTime
+sacctmgr show qos format=Name,MaxWall     # QOS caps
+sacct -j <jobid> -X -o JobID,Timelimit,Elapsed,State
+
+# 17 x 4 h = 68 h, enough for 200 epochs of ImageNet-LT
+bash sbatch/chain.sh 17 --time=04:00:00 imagenet-lt train
+
+# then evaluate once, at the end
+sbatch --dependency=afterany:<last-id> sbatch/run_gfm.sbatch imagenet-lt evaluate
+```
+
+Each link resubmits the same command with `--dependency=afterany` on the
+previous one -- `afterany`, not `afterok`, because a link that TIMEOUTs exits
+non-zero and the next one still has to start. Chain the `train` phase only:
+`encode`/`reference` are one-off, and `evaluate` belongs at the end.
+
+Because resuming is automatic, a stale `train_state.pt` in a run directory will
+be picked up by a later run too. Pass `--resume off` (or use `--tag` for a
+separate directory) when you mean to start over; the run also prints a warning
+if the effective batch changed across a resume.
 
 **Running the three datasets in parallel.** They share nothing that matters --
 encoded latents, reference sets, checkpoints and results are all keyed by

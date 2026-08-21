@@ -89,6 +89,11 @@ def parse_args(argv=None):
                         "keep the effective batch on a card too small to hold it "
                         "in one go (e.g. 32 x 2 == 64 on a 24 GB GPU).")
     p.add_argument("--flow_epochs", type=int, default=200)
+    p.add_argument("--resume", default="auto",
+                   help="'auto' (default) continues from train_state.pt in the "
+                        "run directory when one is there, which is what makes "
+                        "chained jobs (sbatch/chain.sh) behave like one long "
+                        "run. Pass 'off' to ignore it and train from scratch.")
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--base_model", default="dit",
                    choices=["dit", "pnpUNet", "adm", "resnet"])
@@ -209,6 +214,7 @@ those two run without it.""")
                "--train_batch_size", str(a.train_batch_size),
                "--grad_accum_steps", str(a.grad_accum_steps),
                "--flow_epochs", str(a.flow_epochs),
+               "--resume", a.resume,
                "--lr", str(a.lr),
                "--num_workers", str(a.num_workers),
                "--seed", str(a.seed),

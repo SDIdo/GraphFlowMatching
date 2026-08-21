@@ -209,6 +209,19 @@ parser.add_argument('--flow_epochs', type=int, default=200) # was trained for 50
 parser.add_argument('--num_generated_images', type=int, default=20)
 
 parser.add_argument('--retrain_flow_network', action='store_true', help='Train the flow model')
+# Resume that actually continues the run. --retrain_flow_network reloads only
+# the weights, so the optimizer moments and the cosine LR schedule restart from
+# zero; chaining jobs that way is not equivalent to one long run. The state file
+# below carries model + optimizer + scheduler + epoch + step, which is what a
+# cluster with a wall-clock limit shorter than the run needs.
+parser.add_argument('--resume', type=str, default='auto',
+                    help="'auto' (default): continue from train_state.pt under "
+                         "--model_savepath when it exists, else start fresh. "
+                         "'off': always start fresh. Or a path to a state file.")
+parser.add_argument('--state_every_steps', type=int, default=2000,
+                    help='Write the resume state every N optimizer steps (0 = '
+                         'only at epoch boundaries). It holds the optimizer '
+                         'moments too, so it is ~3x the size of vel_net.pt.')
 parser.set_defaults(retrain_flow_network=False)
 
 parser.add_argument('--train_flow', action='store_true', help='Train the flow model')
@@ -568,6 +581,94 @@ if isinstance(args.cleanfid_dataset_name, str) and \
     args.cleanfid_dataset_name = None
 
 
+
+########################################################################
+# Resume state.
+#
+# Slurm kills a job the moment it hits --time, so anything not on disk is lost.
+# The periodic vel_net.pt is enough to *evaluate* an interrupted run but not to
+# continue it: reloading weights alone restarts the AdamW moments and the cosine
+# schedule, which makes N chained jobs behave differently from one job of the
+# same total length. This state file closes that gap.
+########################################################################
+def resume_state_path(args):
+    """Where the state lives, or None when resuming is switched off.
+
+    Returns the path whether or not it exists yet -- callers that care use
+    os.path.exists on it.
+    """
+    mode = str(getattr(args, "resume", "auto")).lower()
+    if mode in ("off", "none", "false", "0"):
+        return None
+    if mode == "auto":
+        return os.path.join(args.model_savepath, "train_state.pt")
+    return args.resume
+
+
+def save_train_state(path, vel_net, optimizer, scheduler, epoch, global_step,
+                     best_fid, args):
+    """Write the state atomically.
+
+    tmp + os.replace, because the writer can be killed at any instant: a
+    half-written state file would otherwise be the thing the next job resumes
+    from. os.replace is atomic within a filesystem, so the old state survives
+    intact until the new one is complete.
+    """
+    payload = {
+        "model": vel_net.state_dict(),
+        "epoch": int(epoch),            # the epoch to RESTART, not the last done
+        "global_step": int(global_step),
+        "best_fid": float(best_fid),
+        "flow_epochs": int(args.flow_epochs),
+        "train_batch_size": int(args.train_batch_size),
+        "grad_accum_steps": int(max(1, args.grad_accum_steps)),
+    }
+    try:
+        payload["optimizer"] = optimizer.state_dict()
+    except Exception as exc:            # e.g. an EMA wrapper without state_dict
+        print(f"[resume] optimizer state not saved ({exc}); a resume will "
+              f"restart the moments")
+    try:
+        payload["scheduler"] = scheduler.state_dict()
+    except Exception as exc:
+        print(f"[resume] scheduler state not saved ({exc})")
+    tmp = path + ".tmp"
+    torch.save(payload, tmp)
+    os.replace(tmp, path)
+
+
+def load_train_state(path, vel_net, optimizer, scheduler, args):
+    """Restore a state file. Returns (start_epoch, global_step, best_fid)."""
+    state = torch.load(path, map_location=args.device, weights_only=False)
+    vel_net.load_state_dict(state["model"])
+    for key, obj in (("optimizer", optimizer), ("scheduler", scheduler)):
+        if key in state:
+            try:
+                obj.load_state_dict(state[key])
+            except Exception as exc:
+                print(f"[resume] could not restore the {key} ({exc}); it "
+                      f"restarts from scratch")
+        else:
+            print(f"[resume] state file has no {key}; it restarts from scratch")
+    start_epoch = int(state.get("epoch", 0))
+    global_step = int(state.get("global_step", 0))
+    best_fid = float(state.get("best_fid", float("inf")))
+    if int(state.get("flow_epochs", args.flow_epochs)) != int(args.flow_epochs):
+        print(f"[resume] NOTE: this state was written by a run of "
+              f"{state.get('flow_epochs')} epochs, now asked for "
+              f"{args.flow_epochs}. The cosine schedule is keyed to "
+              f"--T_cosine_scheduler, not to the epoch count, so this only "
+              f"changes where training stops.")
+    eff_then = state.get("train_batch_size", 0) * state.get("grad_accum_steps", 1)
+    eff_now = args.train_batch_size * max(1, args.grad_accum_steps)
+    if eff_then and eff_then != eff_now:
+        print(f"[resume] WARNING: effective batch changed across the resume "
+              f"({eff_then} -> {eff_now}).")
+    print(f"[resume] continuing from {path}: epoch {start_epoch}, "
+          f"optimizer step {global_step:,}")
+    return start_epoch, global_step, best_fid
+
+
 def unpack_batch(batch):
     """Return (x1, y) from a 2- or 3-tuple batch.
 
@@ -657,7 +758,9 @@ if args.csv_log:
     from utils.loss_logger import CSVLossLogger
     csv_logger = CSVLossLogger(args.model_savepath,
                                log_every_steps=args.log_every_steps,
-                               resume=args.retrain_flow_network)
+                               resume=bool(args.retrain_flow_network
+                                           or (resume_state_path(args)
+                                               and os.path.exists(resume_state_path(args)))))
     with open(os.path.join(args.model_savepath, 'run_config.json'), 'w') as _f:
         import json as _json
         _json.dump(vars(args), _f, indent=2, default=str)
@@ -1092,7 +1195,23 @@ if args.train_flow:
     global_step = 0
     steps_without_improvement = 0
     early_stop = False  # We'll set this flag to True when the patience is exceeded.
-    for epoch in range(epochs):
+
+    # Pick up where an interrupted job stopped. Resuming rewinds to the start of
+    # the epoch that was in progress, so at most one epoch of work is repeated
+    # -- cheap next to re-running from zero, and it keeps the dataloader's epoch
+    # boundaries intact instead of trying to fast-forward it mid-stream.
+    state_path = resume_state_path(args)
+    start_epoch = 0
+    if state_path and os.path.exists(state_path):
+        start_epoch, global_step, best_fid = load_train_state(
+            state_path, vel_net, optimizer, scheduler, args)
+    elif state_path and str(args.resume).lower() not in ("auto",):
+        raise SystemExit(f"\n[resume error] --resume {args.resume} does not "
+                         f"exist. Pass --resume off to start fresh.\n")
+    elif state_path:
+        print(f"[resume] no state at {state_path} -> starting from epoch 0")
+
+    for epoch in range(start_epoch, epochs):
         if args.reproducible:
             # Use a different seed for each epoch by adding the epoch number
             torch.manual_seed(args.seed + epoch)
@@ -1260,6 +1379,15 @@ if args.train_flow:
             if args.save_every_steps > 0 and global_step % args.save_every_steps == 0:
                 torch.save(vel_net, os.path.join(args.model_savepath, 'vel_net.pt'))
                 print(f"[ckpt] step {global_step} -> vel_net.pt")
+
+            # The resume state is bigger (it carries the AdamW moments), so it
+            # gets its own, sparser cadence. `epoch` -- not epoch + 1 -- because
+            # this epoch is only part-done: resuming replays it from its start.
+            if (state_path and args.state_every_steps > 0
+                    and global_step % args.state_every_steps == 0):
+                save_train_state(state_path, vel_net, optimizer, scheduler,
+                                 epoch, global_step, best_fid, args)
+                print(f"[ckpt] step {global_step} -> {os.path.basename(state_path)}")
 
             # Offline CSV mirror of the training curves.
             if csv_logger is not None:
@@ -1453,6 +1581,15 @@ if args.train_flow:
         # if not args.use_step_logging:
         #     scheduler.step(avg_total_loss)
         print(f"======= Flow Epoch {epoch+1}/{epochs}, Loss: {avg_total_loss:.4f}")
+
+        # End of a clean epoch: the cheapest possible resume point, and the one
+        # a chained job normally lands on. epoch + 1 = the epoch to run next.
+        if state_path:
+            torch.save(vel_net, os.path.join(args.model_savepath, 'vel_net.pt'))
+            save_train_state(state_path, vel_net, optimizer, scheduler,
+                             epoch + 1, global_step, best_fid, args)
+            print(f"[ckpt] epoch {epoch+1} -> vel_net.pt + "
+                  f"{os.path.basename(state_path)}")
         
         current_lr = optimizer.param_groups[0]['lr']
         # Log flow loss to wandb

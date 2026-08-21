@@ -154,9 +154,19 @@
 #   python scripts/estimate_runtime.py --run work/runs/cifar10/models \
 #       --dataset cifar10 --epochs 200 --batch_size 64
 #
-# If a job does hit the limit, restart it with --retrain_flow_network. That
-# reloads the weights only -- optimizer state and the cosine LR schedule restart
-# -- so prefer one long job over several chained ones.
+# If a job does hit the limit, just resubmit the same command: train.py writes
+# train_state.pt (model + optimizer + LR schedule + epoch + step) every
+# --state_every_steps and at every epoch boundary, and --resume auto (the
+# default) continues from it. At most one epoch of work is repeated.
+#
+# When the run is longer than the cluster's wall-clock cap, chain it:
+#     bash sbatch/chain.sh 17 --time=04:00:00 imagenet-lt train
+# which submits 17 jobs, each depending (afterany) on the previous one. Check
+# the cap first -- one long job is always better:
+#     sinfo -o '%20P %10l %10L'                 # partition MaxTime / DefaultTime
+#     sacctmgr show qos format=Name,MaxWall     # QOS caps
+# (--retrain_flow_network is NOT the way to continue: it reloads weights only,
+#  restarting the optimizer moments and the cosine schedule on every link.)
 # -----------------------------------------------------------------------------
 # =============================================================================
 
