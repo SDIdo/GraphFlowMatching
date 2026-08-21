@@ -246,6 +246,11 @@ existing copy: `find / -maxdepth 4 -type d -name n01440764 2>/dev/null | head`
 checks the path is readable before doing anything expensive. CIFAR-10 needs
 none of this -- it downloads itself.
 
+A root that passed that check is remembered in `$WORK_DIR/.imagenet_root`, so
+later submissions (`imagenet-lt` after `imagenet`, a re-run after a timeout) can
+omit `DATA_ROOT_IMAGENET` and still find the data. An explicit value always
+wins; `sbatch/site.env` is the place to make it permanent.
+
 **ImageNet as parquet shards.** If `DATA_ROOT_IMAGENET` holds HuggingFace
 parquet shards (`data/train-00000-of-00294.parquet`, ...) instead of a JPEG
 folder tree, that is detected automatically -- no conversion needed. Check what
@@ -290,11 +295,51 @@ its paths actually resolve under the image root before encoding starts. The job 
 `rtx_3090|rtx_4090|rtx_6000|rtx_pro_6000` and always passes `--device cuda:0`,
 since Slurm remaps the allocated card to index 0.
 
+### GPU memory
+
+With the graph correction on, the diffusion term attends over the whole 32x32
+latent grid, so each attention block keeps a `[batch, 1024, 1024]` map alive for
+the backward pass. Peak memory is therefore linear in the batch and the same for
+all three datasets (at `--image_size 256` they all encode to 4x32x32 latents).
+Batch 64 wants ~24 GB, which is why a 3090/4090 dies a few steps in with
+
+```
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 40.00 MiB
+```
+
+So the batch is split in two. `BATCH_SIZE` (default 64) is the **effective**
+batch -- what the optimizer sees, the number to keep fixed. `MICRO_BATCH`
+(default `auto`) is what one forward/backward holds, i.e. what has to fit in
+VRAM; `train.py` accumulates `BATCH_SIZE / MICRO_BATCH` of them per optimizer
+step via `--grad_accum_steps`, so the gradient is unchanged and everything keyed
+to "steps" (cosine LR schedule, `--save_every_steps`, `--checkFID_every_steps`,
+the CSV/wandb curves) still counts optimizer steps.
+
+`auto` reads the card and picks 64 on >=40 GB, 32 on 24 GB, 16 on 16 GB, 8 on
+12 GB. Override either:
+
+```bash
+MICRO_BATCH=16 sbatch --time=72:00:00 sbatch/run_gfm.sbatch imagenet
+BATCH_SIZE=128 MICRO_BATCH=32 sbatch sbatch/run_gfm.sbatch cifar10   # 4x accumulation
+```
+
+Running `train.py` directly, the same thing is `--train_batch_size 32
+--grad_accum_steps 2`. It prints its own estimate at startup and warns before
+the run if the micro-batch cannot fit, and any CUDA OOM traceback is followed by
+the micro-batch/accumulation split that would have fitted. The job also exports
+`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` to keep the smaller,
+shorter-lived allocations from fragmenting the pool.
+
+Accumulating costs perhaps 5-15% throughput (the GPU is fed in smaller pieces)
+and nothing in accuracy.
+
 ### Runtime
 
 Training is pure fp32 (no AMP in `train.py`), ~8.8 TFLOP/step for the default
 DiT-B/2 reaction net at batch 64. Steps per epoch: CIFAR-10 781, ImageNet-LT
-1,810, ImageNet 20,018. Rough 200-epoch training times:
+1,810, ImageNet 20,018 (optimizer steps -- accumulation does not change them).
+Rough 200-epoch training times, assuming the batch fits in one piece; add
+~5-15% on a card that has to accumulate:
 
 | dataset | rtx_3090 | rtx_4090 / 6000 | rtx_pro_6000 |
 | --- | --- | --- | --- |

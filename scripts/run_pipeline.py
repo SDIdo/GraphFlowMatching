@@ -77,7 +77,14 @@ def parse_args(argv=None):
                    help="Fail instead of reconstructing an ImageNet-LT split. "
                         "Use this to guarantee the official split was used.")
 
-    p.add_argument("--train_batch_size", type=int, default=64)
+    p.add_argument("--train_batch_size", type=int, default=64,
+                   help="Micro-batch: what one forward/backward must fit in "
+                        "VRAM. With --grad_accum_steps the optimizer still sees "
+                        "train_batch_size * grad_accum_steps samples per step.")
+    p.add_argument("--grad_accum_steps", type=int, default=1,
+                   help="Micro-batches accumulated per optimizer step. Use it to "
+                        "keep the effective batch on a card too small to hold it "
+                        "in one go (e.g. 32 x 2 == 64 on a 24 GB GPU).")
     p.add_argument("--flow_epochs", type=int, default=200)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--base_model", default="dit",
@@ -146,6 +153,9 @@ def main(argv=None):
     print(f"[pipeline] dataset={a.dataset} image_size={image_size} "
           f"latent={image_size // 8} eval_size={eval_size}"
           + (f" tag={tag}" if tag else ""))
+    print(f"[pipeline] micro_batch={a.train_batch_size} x "
+          f"grad_accum={a.grad_accum_steps} -> effective batch "
+          f"{a.train_batch_size * max(1, a.grad_accum_steps)}")
     print(f"[pipeline] work_dir={work}")
     print(f"[pipeline] stages={stages}")
 
@@ -184,6 +194,7 @@ def main(argv=None):
                "--adj_mode", a.adj_mode,
                "--flow_model_type", "nonLinearHeatDiffusion2",
                "--train_batch_size", str(a.train_batch_size),
+               "--grad_accum_steps", str(a.grad_accum_steps),
                "--flow_epochs", str(a.flow_epochs),
                "--lr", str(a.lr),
                "--num_workers", str(a.num_workers),

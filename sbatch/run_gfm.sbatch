@@ -84,9 +84,34 @@
 #
 # Overridable via the environment:
 #   DATA_ROOT_CIFAR10, DATA_ROOT_IMAGENET, WORK_DIR, HF_HOME, TORCH_HOME,
-#   BATCH_SIZE, EPOCHS, EVAL_SAMPLES, REF_IMAGES, GFM_VARIANTS,
+#   BATCH_SIZE, MICRO_BATCH, EPOCHS, EVAL_SAMPLES, REF_IMAGES, GFM_VARIANTS,
 #   IMAGENET_LT_SPLIT, GFM_CACHE_DIR
 #
+# -----------------------------------------------------------------------------
+# GPU MEMORY -- why BATCH_SIZE is not what has to fit.
+#
+# With the graph correction on, the diffusion term runs attention over the whole
+# 32x32 latent grid, so each attention block holds a [batch, 1024, 1024] map for
+# the backward pass. Measured: batch 64 wants ~24 GB, so it dies on a 3090/4090
+# (23.5 GiB usable) with
+#     torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 40.00 MiB
+# a few steps in. That is true of every dataset here -- at --image_size 256 they
+# all encode to 4x32x32 latents, so the cost per sample is identical.
+#
+# So the batch is split in two:
+#   BATCH_SIZE  (default 64) is the EFFECTIVE batch -- the one the optimizer
+#               sees, the number the paper reports, the number to keep fixed.
+#   MICRO_BATCH (default auto) is what a single forward/backward holds, i.e.
+#               what has to fit in VRAM. train.py accumulates
+#               BATCH_SIZE / MICRO_BATCH of them per optimizer step, so the
+#               gradient -- and the LR schedule, checkpoint and FID cadences,
+#               which all count optimizer steps -- are unchanged.
+#
+# 'auto' reads the card's memory and picks: 64 on >=40 GB, 32 on 24 GB, 16 on
+# 16 GB, 8 on 12 GB. Override either one explicitly, e.g. for a 24 GB card:
+#     MICRO_BATCH=32 sbatch sbatch/run_gfm.sbatch imagenet
+# Accumulating costs a little throughput (the GPU is fed in smaller pieces),
+# perhaps 5-15%, and nothing in accuracy.
 # -----------------------------------------------------------------------------
 # WALL-CLOCK BUDGET -- read this before submitting.
 #
@@ -96,7 +121,9 @@
 #
 #   steps/epoch at batch 64:  CIFAR-10 781 | ImageNet-LT 1,810 | ImageNet 20,018
 #
-# Rough training time for 200 epochs (wide bands: measure yours, see below):
+# Rough training time for 200 epochs (wide bands: measure yours, see below).
+# These assume the whole effective batch fits at once; a card that has to
+# accumulate (see GPU MEMORY above) is a further ~5-15% slower:
 #
 #   dataset        rtx_3090        rtx_4090 / 6000     rtx_pro_6000
 #   CIFAR-10       ~28 h           ~13 h               ~9 h
@@ -182,6 +209,14 @@ DATA_ROOT_CIFAR10="${DATA_ROOT_CIFAR10:-$WORK_DIR/data/cifar10}"
 # never downloaded automatically. A wrong placeholder here just produces a
 # confusing PermissionError, so require it to be set.
 DATA_ROOT_IMAGENET="${DATA_ROOT_IMAGENET:-}"
+# ...but a root that already worked is remembered under WORK_DIR, so the second
+# and later submissions (imagenet-lt after imagenet, a re-run after a timeout)
+# do not have to repeat it on the command line.
+IMAGENET_ROOT_MEMO="$WORK_DIR/.imagenet_root"
+if [ -z "$DATA_ROOT_IMAGENET" ] && [ -r "$IMAGENET_ROOT_MEMO" ]; then
+    DATA_ROOT_IMAGENET="$(cat "$IMAGENET_ROOT_MEMO")"
+    echo "[data] DATA_ROOT_IMAGENET unset -> reusing remembered root: $DATA_ROOT_IMAGENET"
+fi
 if [ "$DATASET" == "cifar10" ]; then
     DATA_ROOT="$DATA_ROOT_CIFAR10"
 else
@@ -199,7 +234,8 @@ if [ "$DATASET" != "cifar10" ] && [ "$PHASE" != "report" ] && [ "$PHASE" != "war
             echo "ERROR: ImageNet root not readable: $DATA_ROOT" >&2
         fi
         echo >&2
-        echo "       Point it at the real location:" >&2
+        echo "       Point it at the real location (it is then remembered in" >&2
+        echo "       $IMAGENET_ROOT_MEMO for later submissions):" >&2
         echo "         DATA_ROOT_IMAGENET=/path/to/imagenet \\" >&2
         echo "           sbatch --time=72:00:00 sbatch/run_gfm.sbatch $DATASET $PHASE" >&2
         echo >&2
@@ -213,6 +249,7 @@ if [ "$DATASET" != "cifar10" ] && [ "$PHASE" != "report" ] && [ "$PHASE" != "war
         exit 1
     fi
     echo "[data] ImageNet root OK: $DATA_ROOT"
+    printf '%s' "$DATA_ROOT" > "$IMAGENET_ROOT_MEMO" 2>/dev/null || true
 fi
 
 # Writable cache for the ImageNet-LT split file -- never the (read-only) dataset root.
@@ -248,7 +285,56 @@ if [ "$DATASET" == "imagenet-lt" ] && [ "$PHASE" != "report" ] && [ "$PHASE" != 
     fi
 fi
 
+# Effective batch (what the optimizer sees) and the micro-batch that actually
+# has to fit in VRAM. See the GPU MEMORY section at the top.
 BATCH_SIZE="${BATCH_SIZE:-64}"
+MICRO_BATCH="${MICRO_BATCH:-auto}"
+
+if [ "$MICRO_BATCH" == "auto" ]; then
+    # nvidia-smi reports only the GPUs allocated to this job, so head -n1 is the
+    # card we will actually train on. On a node without one (warmup, report) the
+    # query fails and we simply leave the batch whole.
+    # '|| true': with pipefail a missing nvidia-smi (login node, CPU partition)
+    # would otherwise take the whole script down through set -e.
+    GPU_MEM_MIB="$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -n1 | tr -d '[:space:]' || true)"
+    case "${GPU_MEM_MIB:-}" in
+        ''|*[!0-9]*)
+            echo "[gpu] no usable nvidia-smi reading -> keeping the batch whole"
+            MICRO_BATCH="$BATCH_SIZE" ;;
+        *)
+            # ~2.5 GB fixed (weights, grads, AdamW moments) + ~0.33 GB per
+            # sample of activations, against ~92% of the card.
+            if   [ "$GPU_MEM_MIB" -ge 40000 ]; then MICRO_BATCH=64
+            elif [ "$GPU_MEM_MIB" -ge 22000 ]; then MICRO_BATCH=32
+            elif [ "$GPU_MEM_MIB" -ge 14000 ]; then MICRO_BATCH=16
+            elif [ "$GPU_MEM_MIB" -ge 10000 ]; then MICRO_BATCH=8
+            else                                    MICRO_BATCH=4
+            fi
+            echo "[gpu] ${GPU_MEM_MIB} MiB visible -> micro-batch ${MICRO_BATCH}" ;;
+    esac
+fi
+
+for _v in BATCH_SIZE MICRO_BATCH; do
+    case "${!_v}" in
+        ''|*[!0-9]*) echo "ERROR: $_v must be a positive integer (got '${!_v}')" >&2
+                     exit 2 ;;
+    esac
+done
+
+# Never larger than the effective batch, and always a divisor of it so that
+# micro x accum lands exactly on BATCH_SIZE.
+if [ "$MICRO_BATCH" -gt "$BATCH_SIZE" ]; then MICRO_BATCH="$BATCH_SIZE"; fi
+if [ "$MICRO_BATCH" -lt 1 ]; then MICRO_BATCH=1; fi
+while [ $((BATCH_SIZE % MICRO_BATCH)) -ne 0 ]; do
+    MICRO_BATCH=$((MICRO_BATCH - 1))
+done
+GRAD_ACCUM=$((BATCH_SIZE / MICRO_BATCH))
+
+# Accumulation leaves a lot of short-lived allocations behind; expandable
+# segments keep them from fragmenting the pool into an OOM that has the memory
+# but not one contiguous block of it.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+
 EPOCHS="${EPOCHS:-200}"
 EVAL_SAMPLES="${EVAL_SAMPLES:-10000}"
 REF_IMAGES="${REF_IMAGES:-50000}"
@@ -294,7 +380,8 @@ echo " host=$(hostname)  job=${SLURM_JOB_ID:-none}"
 echo " dataset=${DATASET}  phase=${PHASE}  extra_args=$*"
 echo " data_root=${DATA_ROOT}"
 echo " work_dir=${WORK_DIR}"
-echo " workers=${NUM_WORKERS}  batch=${BATCH_SIZE}  epochs=${EPOCHS}"
+echo " workers=${NUM_WORKERS}  epochs=${EPOCHS}"
+echo " batch=${BATCH_SIZE} (micro ${MICRO_BATCH} x accum ${GRAD_ACCUM})"
 echo "=================================================="
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true
 
@@ -305,7 +392,8 @@ COMMON=(
     --work_dir "$WORK_DIR"
     --device "$DEVICE"
     --num_workers "$NUM_WORKERS"
-    --train_batch_size "$BATCH_SIZE"
+    --train_batch_size "$MICRO_BATCH"
+    --grad_accum_steps "$GRAD_ACCUM"
     --flow_epochs "$EPOCHS"
     --num_eval_samples "$EVAL_SAMPLES"
     --num_reference_images "$REF_IMAGES"

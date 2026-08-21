@@ -188,6 +188,16 @@ parser.add_argument('--image_savepath', type=str, default='/home/shahriar/FlowMa
 parser.add_argument('--device', type=str, default='cuda:1')
 
 parser.add_argument('--train_batch_size', type=int, default=50) #256 for 13 mil case #115 for 16.5 mil case
+# Micro-batching. --train_batch_size is what one forward/backward holds, so
+# it -- not the effective batch -- is what has to fit in VRAM. The optimizer
+# still sees train_batch_size * grad_accum_steps samples per update, which is
+# how a 24 GB card keeps the paper's batch of 64 at --image_size 256:
+#     --train_batch_size 32 --grad_accum_steps 2
+# Everything counted in "steps" (the cosine schedule, --save_every_steps,
+# --checkFID_every_steps, the CSV/wandb curves) counts OPTIMIZER steps, so
+# those cadences keep their meaning at any accumulation factor.
+parser.add_argument('--grad_accum_steps', type=int, default=1,
+                    help='Micro-batches accumulated per optimizer step. Effective batch = train_batch_size * grad_accum_steps.')
 parser.add_argument('--num_workers', type=int, default=0) #16
 
 parser.add_argument('--latent_channels', type=int, default=4)  # CHANGED: Default to 4 for SD VAE
@@ -440,8 +450,116 @@ def validate_device(args):
           f"{props.total_memory / 1e9:.1f} GB")
 
 
+########################################################################
+# VRAM budgeting.
+#
+# Peak training memory is dominated by the graph/diffusion term: with
+# --diffusion it runs two UNet2 stacks whose attention blocks act on the whole
+# 32x32 latent grid, so every attention map is a [batch, 1024, 1024] tensor that
+# stays alive for the backward pass. The cost is linear in the batch and the
+# same for CIFAR-10, ImageNet and ImageNet-LT -- at --image_size 256 they all
+# encode to 4x32x32 latents.
+#
+# The slope below is a straight line through ONE measured failure: batch 64 with
+# the graph term on exhausted a 23.5 GB RTX 4090 with 22.9 GB already allocated.
+# Treat it as an order-of-magnitude guide; it only ever prints, never refuses.
+########################################################################
+_MEM_FIXED_GB = 2.5            # weights + grads + the two AdamW moments
+_MEM_PER_SAMPLE_GB = 0.33      # activations with the graph/diffusion term on
+_MEM_PER_SAMPLE_NO_DIFFUSION_GB = 0.12   # reaction network alone (rough)
+
+
+def estimate_peak_gb(args, batch):
+    """Rough peak allocation for a single micro-batch of `batch` latents."""
+    per_sample = (_MEM_PER_SAMPLE_GB if args.diffusion
+                  else _MEM_PER_SAMPLE_NO_DIFFUSION_GB)
+    scale = (args.latent_size / 32.0) ** 2
+    return _MEM_FIXED_GB + batch * per_sample * scale
+
+
+def usable_vram_gb(args):
+    """Memory we can actually allocate, or None on CPU/no CUDA.
+
+    The 0.92 leaves room for the CUDA context, the cuDNN workspaces and the
+    fragmentation that the allocator cannot hand back.
+    """
+    if not str(args.device).startswith("cuda") or not torch.cuda.is_available():
+        return None
+    idx = int(str(args.device).split(":")[1]) if ":" in str(args.device) else 0
+    return 0.92 * torch.cuda.get_device_properties(idx).total_memory / 1e9
+
+
+def suggest_micro_batch(args, usable_gb):
+    """Largest divisor of the effective batch whose micro-batch is estimated to fit.
+
+    Divisors only: keeping effective = micro * accum exact means the run still
+    optimizes over the batch size it was configured with.
+    """
+    effective = args.train_batch_size * max(1, args.grad_accum_steps)
+    for micro in sorted((d for d in range(1, effective + 1) if effective % d == 0),
+                        reverse=True):
+        if estimate_peak_gb(args, micro) <= usable_gb:
+            return micro, effective // micro
+    return 1, effective
+
+
+def check_batch_fits(args):
+    """Warn before the queue slot is burned if the micro-batch cannot fit."""
+    usable_gb = usable_vram_gb(args)
+    if usable_gb is None:
+        return
+    need_gb = estimate_peak_gb(args, args.train_batch_size)
+    accum = max(1, args.grad_accum_steps)
+    print(f"[setup] micro-batch={args.train_batch_size} x grad_accum={accum} "
+          f"-> effective batch {args.train_batch_size * accum}; "
+          f"estimated peak ~{need_gb:.1f} GB of ~{usable_gb:.1f} GB usable")
+    if need_gb <= usable_gb:
+        return
+    micro, new_accum = suggest_micro_batch(args, usable_gb)
+    print(f"""
+[memory warning] a micro-batch of {args.train_batch_size} latents is estimated to
+need ~{need_gb:.1f} GB, but this GPU only offers ~{usable_gb:.1f} GB. Expect a CUDA
+out-of-memory error within the first few steps.
+Same effective batch ({args.train_batch_size * accum}), split into pieces that fit:
+    --train_batch_size {micro} --grad_accum_steps {new_accum}
+(or MICRO_BATCH={micro} when submitting sbatch/run_gfm.sbatch).
+""", flush=True)
+
+
+def install_oom_reporter(args):
+    """Append an actionable hint to any CUDA out-of-memory traceback.
+
+    An OOM can surface from the training step, from the in-training FID sampler
+    or from the VAE decode, and the bare PyTorch message never says which knob
+    to turn. This leaves the traceback intact and prints the fix underneath it.
+    """
+    previous = sys.excepthook
+
+    def hook(exc_type, exc, tb):
+        previous(exc_type, exc, tb)
+        if not issubclass(exc_type, torch.cuda.OutOfMemoryError):
+            return
+        usable_gb = usable_vram_gb(args) or estimate_peak_gb(args, args.train_batch_size)
+        micro, accum = suggest_micro_batch(args, usable_gb)
+        print(f"""
+[out of memory] with --diffusion the graph term keeps a [batch, 1024, 1024]
+attention map per attention block alive for the backward pass, so peak memory
+grows linearly with --train_batch_size (currently {args.train_batch_size}).
+Keep the effective batch, shrink what has to fit at once:
+    --train_batch_size {micro} --grad_accum_steps {accum}
+Worth exporting before python, too:
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+If the OOM came from the in-training FID probe rather than from a training step,
+lower --fid_batch_size (currently {args.fid_batch_size}) instead.
+""", file=sys.stderr, flush=True)
+
+    sys.excepthook = hook
+
+
 validate_model_config(args)
 validate_device(args)
+check_batch_fits(args)
+install_oom_reporter(args)
 
 # 'none' disables the (expensive) in-training FID probe, which requires
 # pre-built clean-fid statistics to exist.
@@ -962,6 +1080,13 @@ if args.train_flow:
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, args.T_cosine_scheduler, eta_min=5e-5, verbose=True) # for LSUN Bedrooms
     epochs = args.flow_epochs
     batches = len(train_loader)
+    # Micro-batching: `accum` forward/backward passes make one optimizer step, so
+    # the gradient is the one a batch of train_batch_size * accum would have
+    # produced. `global_step` still counts optimizer steps, which is the unit the
+    # LR schedule, the checkpoint cadence and the FID probe are tuned in.
+    accum = max(1, args.grad_accum_steps)
+    micros_in_step = 0          # micro-batches already accumulated for this step
+    step_loss = step_diff = step_react = 0.0
     fid_true_vs_flow_trial=float('inf')  # initialize 
     vel_net.train()
     global_step = 0
@@ -987,7 +1112,8 @@ if args.train_flow:
                 torch.manual_seed(args.seed + epoch * 10000 + batch_idx)
 
             x1 =  x1.to(args.device)
-            optimizer.zero_grad()
+            if micros_in_step == 0:
+                optimizer.zero_grad()
             
             # When using pre-encoded data, x1 is already the latent vector, no need to encode
             if not args.use_pre_encoded and enc is not None:
@@ -1060,9 +1186,22 @@ if args.train_flow:
 
             # with torch.autograd.detect_anomaly():
             loss = velocity_loss
-            loss.backward()
+            # 1/accum so the accumulated gradient is the MEAN over the effective
+            # batch, exactly what one large batch would give. An epoch whose last
+            # group is short is scaled by the same 1/accum, i.e. it takes a
+            # slightly smaller step -- the usual, harmless, accumulation edge.
+            (loss / accum).backward()
 
-            torch.nn.utils.clip_grad_norm_(vel_net.parameters(), max_norm=1.0) # clip gradients to prevent exploding gradients
+            micros_in_step += 1
+            step_loss += loss.item() / accum
+            step_diff += diffusion_term.item() / accum
+            step_react += reaction_term.item() / accum
+            # An optimizer step falls on every `accum`-th micro-batch, and on the
+            # epoch's last one so a short final group is not silently dropped.
+            is_step = (micros_in_step == accum) or (batch_idx + 1 == batches)
+
+            if is_step:
+                torch.nn.utils.clip_grad_norm_(vel_net.parameters(), max_norm=1.0) # clip gradients to prevent exploding gradients
             
             ################# CHECK THAT NO GRADIENTS ARE FLOWING THROUGH VAE ########
             # Verify no gradients in VAE (add this check)
@@ -1087,20 +1226,33 @@ if args.train_flow:
             ###################
 
             ###################
-            optimizer.step()
-            
-            scheduler.step()  # if doing this every iteration, have an appropriate number of "steps" in the scheduler
-            # if args.use_step_logging:
-                # scheduler.step(loss)
-
             total_loss += loss.item()
             total_diffusion_term += diffusion_term.item()
             total_reaction_term += reaction_term.item()
 
             print('%d  %d/%d  %3.2e' % (epoch, it, batches, loss))
             it += 1
-            # Increment the global step counter for each batch processed.
+
+            if not is_step:
+                # Still filling the effective batch: no update yet, and nothing
+                # to log or checkpoint -- that is all per-optimizer-step below.
+                continue
+
+            optimizer.step()
+            
+            scheduler.step()  # if doing this every iteration, have an appropriate number of "steps" in the scheduler
+            # if args.use_step_logging:
+                # scheduler.step(loss)
+
+            # One completed optimizer step.
             global_step += 1
+            # The logged loss/terms are the means over the micro-batches that fed
+            # this step, so the curves keep their shape at any `accum`.
+            loss_value = step_loss * (accum / micros_in_step)
+            diffusion_value = step_diff * (accum / micros_in_step)
+            reaction_value = step_react * (accum / micros_in_step)
+            micros_in_step = 0
+            step_loss = step_diff = step_react = 0.0
 
             # Periodic checkpointing that does not depend on the FID probe.
             # Without this, disabling in-training FID (--cleanfid_dataset_name
@@ -1111,8 +1263,8 @@ if args.train_flow:
 
             # Offline CSV mirror of the training curves.
             if csv_logger is not None:
-                csv_logger.log_step(global_step, epoch, loss.item(),
-                                    diffusion_term.item(), reaction_term.item(),
+                csv_logger.log_step(global_step, epoch, loss_value,
+                                    diffusion_value, reaction_value,
                                     optimizer.param_groups[0]['lr'])
 
             # If step-based logging is enabled, log at the specified step frequency.
@@ -1122,9 +1274,9 @@ if args.train_flow:
 
                     wandb.log({
                         "global_step": global_step,
-                        "batch_loss": loss.item(),
-                        "diffusion_term.abs().max()":diffusion_term.item(),
-                        "reaction_term.abs().max()":reaction_term.item(),
+                        "batch_loss": loss_value,
+                        "diffusion_term.abs().max()":diffusion_value,
+                        "reaction_term.abs().max()":reaction_value,
                         "lr": current_lr
                     })
 
