@@ -303,7 +303,10 @@ filenames**. ImageNet-LT selects ~115k specific images by name, so:
 Matching is on the **lowercased, extension-less basename** (`n01440764_190`),
 which is unique across ImageNet, so the cosmetic rewrites a conversion applies
 -- `.JPEG` -> `.jpg`, a kept or dropped `train/n01440764/` prefix, flipped path
-separators -- do not break it. If the match still fails, the error prints the
+separators -- do not break it. Rows are additionally indexed under the name with
+a trailing duplicate wnid removed, since one HF conversion in circulation names
+its rows `n03954731_53652_n03954731.JPEG`; no genuine ImageNet name ends in
+`_n########`, so undoing that decoration cannot shadow a real file. If the match still fails, the error prints the
 names it found beside the names the split asked for, so you can see the shape of
 the mismatch rather than guess. Shards that renumber their rows (`0.jpg`,
 `1.jpg`, ...) carry no way back to the official split: either encode from a
