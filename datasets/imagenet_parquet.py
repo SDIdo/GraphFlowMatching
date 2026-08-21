@@ -32,6 +32,7 @@ long-tailed subset from the labels, which is *not* the official split.
 import glob
 import io
 import os
+import re
 import random
 from collections import Counter, OrderedDict
 
@@ -166,6 +167,31 @@ def canonical_name(value):
     return os.path.splitext(base)[0].lower()
 
 
+# A stem that ends in a second copy of a wnid: 'n03954731_53652_n03954731',
+# which is how at least one HF conversion of ImageNet-1k names its rows. No
+# genuine ImageNet name ends that way -- train stems are '<wnid>_<int>' and val
+# stems are 'ILSVRC2012_val_<8 digits>' -- so stripping it cannot shadow a real
+# file, and it recovers the original name exactly.
+_TRAILING_WNID = re.compile(r"_n[0-9]{8}$")
+
+
+def name_variants(value):
+    """Every key a shard row should be indexed under, most literal first.
+
+    The split file is the fixed side of the match, so all the tolerance lives
+    here: index each row under its own name AND under the undecorated name, and
+    an exact lookup then finds it either way.
+    """
+    stem = canonical_name(value)
+    if not stem:
+        return []
+    variants = [stem]
+    trimmed = _TRAILING_WNID.sub("", stem)
+    if trimmed and trimmed != stem:
+        variants.append(trimmed)
+    return variants
+
+
 def match_split_to_rows(rows, split_samples, verbose=True):
     """Map an ImageNet-LT split file onto parquet rows by filename.
 
@@ -180,8 +206,7 @@ def match_split_to_rows(rows, split_samples, verbose=True):
     for r in rows:
         nm = r[4]
         if nm:
-            key = canonical_name(nm)
-            if key:
+            for key in name_variants(nm):
                 by_name.setdefault(key, r)
     if not by_name:
         raise ValueError("parquet shards carry no filenames; cannot match the "
