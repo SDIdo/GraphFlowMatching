@@ -75,6 +75,11 @@ def parse_args(argv=None):
                         "wrong GPU on a multi-GPU box and fails on a CPU-only "
                         "one. Falls back to cpu when CUDA is unavailable.")
     p.add_argument("--stats_batch_size", type=int, default=64)
+    p.add_argument("--reuse_stats", action="store_true",
+                   help="Keep an existing clean-fid stats file instead of "
+                        "rebuilding it. Only safe when the reference images "
+                        "have not changed; by default the stats are rebuilt so "
+                        "they always describe the images just written.")
     return p.parse_args(argv)
 
 
@@ -82,6 +87,27 @@ def to_uint8(x):
     """[-1, 1] float tensor -> uint8 HWC numpy."""
     x = ((x.clamp(-1, 1) + 1.0) * 127.5).round().to(torch.uint8)
     return x.permute(1, 2, 0).cpu().numpy()
+
+
+def cleanfid_stats_exist(name, mode="clean"):
+    """Does clean-fid already hold custom stats under this name?
+
+    clean-fid has no public predicate in every version, so ask its own helper
+    when it exists and fall back to the file layout make_custom_stats uses:
+    ``<pkg>/stats/<name>_<mode>[_<model>]_custom_na.npz``.
+    """
+    try:
+        from cleanfid.fid import test_stats_exists
+        return bool(test_stats_exists(name, mode))
+    except Exception:
+        pass
+    try:
+        import glob
+        import cleanfid
+        folder = os.path.join(os.path.dirname(cleanfid.__file__), "stats")
+        return bool(glob.glob(os.path.join(folder, f"{name}_{mode}*custom_na.npz")))
+    except Exception:
+        return False
 
 
 def main(argv=None):
@@ -154,6 +180,26 @@ def main(argv=None):
         if "cuda" in str(device) and not torch.cuda.is_available():
             print("[cleanfid] CUDA requested but unavailable -> using CPU")
             device = "cpu"
+        # clean-fid refuses to overwrite an existing stats file -- it raises
+        # "The statistics file <name> already exists", which would make every
+        # re-run of this stage fail after it had already rewritten the images.
+        # The stats have to describe the images just written, so the default is
+        # to replace them; --reuse_stats keeps what is there.
+        if cleanfid_stats_exist(args.cleanfid_name, args.cleanfid_mode):
+            if args.reuse_stats:
+                print(f"[cleanfid] stats '{args.cleanfid_name}' already exist "
+                      f"-> reusing them (--reuse_stats)")
+                print(f"[cleanfid] train with --cleanfid_dataset_name "
+                      f"{args.cleanfid_name}")
+                return
+            print(f"[cleanfid] stats '{args.cleanfid_name}' already exist "
+                  f"-> rebuilding them for the {written:,} images just written")
+            try:
+                fid.remove_custom_stats(args.cleanfid_name,
+                                        mode=args.cleanfid_mode)
+            except Exception as exc:      # already gone, or a layout we cannot guess
+                print(f"[cleanfid] could not remove the old stats ({exc}); "
+                      f"trying to build over them")
         print(f"[cleanfid] building custom stats '{args.cleanfid_name}' "
               f"(mode={args.cleanfid_mode}, device={device})")
         # Same Windows dedup guard the FID path uses: clean-fid globs once per

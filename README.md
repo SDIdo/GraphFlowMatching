@@ -470,6 +470,12 @@ variants (attention / cosine / kNN adjacency, plus a no-graph baseline) via
   filesystem every file matches twice. The FID wrapper narrows the extension set
   to the suffixes actually present for the duration of the call, so counts and
   compute are correct.
+- **The reference stage is re-runnable.** `clean-fid` refuses to overwrite an
+  existing custom-stats file (`The statistics file <name> already exists. Use
+  remove_custom_stats ...`), which used to make any second run of `reference`
+  crash *after* it had rewritten all 50k images. The stats are now removed and
+  rebuilt so they always describe the images just written; pass `--reuse_stats`
+  to keep the existing ones when the images have not changed.
 - **`--num_workers > 0` on Windows** uses spawn, so anything passed to a
   DataLoader must be picklable; the metrics code uses `functools.partial`
   rather than a lambda for its collate function.
