@@ -232,9 +232,17 @@ if [ -z "$DATA_ROOT_IMAGENET" ] && [ -r "$IMAGENET_ROOT_MEMO" ]; then
     echo "[data] DATA_ROOT_IMAGENET unset -> remembered root: $DATA_ROOT_IMAGENET"
 fi
 if [ -z "$DATA_ROOT_IMAGENET" ] && [ "$DATASET" != "cifar10" ]; then
-    for _meta in "$WORK_DIR"/encoded/"$SLUG"_*/metadata.json; do
+    # imagenet and imagenet-lt are the SAME image tree (LT is a 115k subset of
+    # it), so either one's encode metadata locates the root for the other. The
+    # dataset's own directory is tried first, then any other encoded set; the
+    # "dataset" field is checked so a CIFAR-10 encode never answers here.
+    IMAGENET_ROOT_SEARCHED="$WORK_DIR/encoded/*/metadata.json"
+    for _meta in "$WORK_DIR"/encoded/"$SLUG"_*/metadata.json                  "$WORK_DIR"/encoded/*/metadata.json; do
         [ -r "$_meta" ] || continue
-        _root="$(python -c 'import json,sys; print(json.load(open(sys.argv[1])).get("source_root",""))' "$_meta" 2>/dev/null || true)"
+        _root="$(python -c 'import json, sys
+meta = json.load(open(sys.argv[1]))
+name = str(meta.get("dataset", ""))
+print(meta.get("source_root", "") if name.startswith("imagenet") else "")' "$_meta" 2>/dev/null || true)"
         if [ -n "$_root" ] && [ -d "$_root" ]; then
             DATA_ROOT_IMAGENET="$_root"
             echo "[data] recovered ImageNet root from $_meta: $DATA_ROOT_IMAGENET"
@@ -257,6 +265,9 @@ if [ "$DATASET" != "cifar10" ] && [ "$NEEDS_RAW" -eq 1 ]; then
             echo "ERROR: DATA_ROOT_IMAGENET is not set, and phase '$PHASE' reads the" >&2
             echo "       raw ImageNet images (encode and reference do; train," >&2
             echo "       evaluate, plot, paper and report do not)." >&2
+            echo "       Looked for a remembered one in:" >&2
+            echo "         $IMAGENET_ROOT_MEMO" >&2
+            echo "         ${IMAGENET_ROOT_SEARCHED:-$WORK_DIR/encoded/*/metadata.json}  (\"source_root\")" >&2
         else
             echo "ERROR: ImageNet root not readable: $DATA_ROOT" >&2
         fi
