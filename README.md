@@ -282,8 +282,10 @@ always wins; `sbatch/site.env` is the place to make it permanent.
 
 **ImageNet as parquet shards.** If `DATA_ROOT_IMAGENET` holds HuggingFace
 parquet shards (`data/train-00000-of-00294.parquet`, ...) instead of a JPEG
-folder tree, that is detected automatically -- no conversion needed. Check what
-you have first:
+folder tree, that is detected automatically -- no conversion needed. If the root
+holds **both**, full ImageNet uses the shards (it takes every row, so names are
+irrelevant) while ImageNet-LT prefers the folder tree, whose filenames the
+official split can always address. Check what you have first:
 
 ```bash
 python datasets/inspect_parquet.py --root /path/to/ImageNet/data
@@ -297,6 +299,17 @@ filenames**. ImageNet-LT selects ~115k specific images by name, so:
   which reproduces the long-tailed profile but not the official image list, and
   is reported as `pareto_reconstruction_parquet` in the metadata. Pass
   `--no_pareto_fallback` to refuse it instead.
+
+Matching is on the **lowercased, extension-less basename** (`n01440764_190`),
+which is unique across ImageNet, so the cosmetic rewrites a conversion applies
+-- `.JPEG` -> `.jpg`, a kept or dropped `train/n01440764/` prefix, flipped path
+separators -- do not break it. If the match still fails, the error prints the
+names it found beside the names the split asked for, so you can see the shape of
+the mismatch rather than guess. Shards that renumber their rows (`0.jpg`,
+`1.jpg`, ...) carry no way back to the official split: either encode from a
+JPEG-folder ImageNet, or opt in to the reconstruction with
+`GFM_ALLOW_PARETO=1 sbatch ...` (which drops `--no_pareto_fallback`) and accept
+that the numbers are not comparable to published ImageNet-LT results.
 
 Indexing reads only the label and filename columns, never the image bytes
 (~0.5% of the data), so scanning 294 shards costs seconds. Batches are kept

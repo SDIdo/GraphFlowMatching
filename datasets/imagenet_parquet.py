@@ -148,36 +148,64 @@ def build_index(shards, want_names=True, verbose=True):
     return rows, image_col, label_col, name_leaf
 
 
+def canonical_name(value):
+    """The key a filename is matched under, immune to cosmetic rewrites.
+
+    A conversion to parquet routinely changes an ImageNet filename in ways that
+    carry no information: it lowercases or rewrites the extension
+    (``.JPEG`` -> ``.jpg``), keeps or drops the directory prefix
+    (``train/n01440764/n01440764_190.JPEG``), or flips the path separator.
+    Reducing both sides to the lowercased, extension-less basename absorbs all
+    of that while staying exact -- ImageNet stems (``n01440764_190``) are unique
+    across the whole dataset, so nothing collides.
+    """
+    text = str(value).replace("\\", "/").strip()
+    if not text:
+        return ""
+    base = text.rsplit("/", 1)[-1]
+    return os.path.splitext(base)[0].lower()
+
+
 def match_split_to_rows(rows, split_samples, verbose=True):
     """Map an ImageNet-LT split file onto parquet rows by filename.
 
     ``split_samples`` is the ``[(relpath, label), ...]`` list from
-    ``read_lt_split_file``. Matching is on basename, which is unique across
-    ImageNet (``n01440764_190.JPEG``).
+    ``read_lt_split_file``. Matching is on :func:`canonical_name`.
 
-    Returns ``(selected_rows, n_missing)``.
+    Returns ``(selected_rows, n_missing, diagnostics)``; ``diagnostics`` carries
+    example names from both sides so a failure can show what it actually saw
+    rather than speculating about it.
     """
     by_name = {}
     for r in rows:
         nm = r[4]
         if nm:
-            by_name[os.path.basename(str(nm))] = r
+            key = canonical_name(nm)
+            if key:
+                by_name.setdefault(key, r)
     if not by_name:
         raise ValueError("parquet shards carry no filenames; cannot match the "
                          "official ImageNet-LT split")
 
-    selected, missing = [], 0
+    selected, missing, unmatched = [], 0, []
     for relpath, label in split_samples:
-        r = by_name.get(os.path.basename(relpath))
+        r = by_name.get(canonical_name(relpath))
         if r is None:
             missing += 1
+            if len(unmatched) < 5:
+                unmatched.append(relpath)
             continue
         # Trust the split file's label (it is the canonical wnid ordering).
         selected.append((r[0], r[1], r[2], int(label), r[4]))
+    diagnostics = {
+        "shard_names": [str(r[4]) for r in rows[:200] if r[4]][:5],
+        "unmatched_split_names": unmatched,
+        "n_named_rows": len(by_name),
+    }
     if verbose:
         print(f"[parquet] matched {len(selected):,}/{len(split_samples):,} "
               f"split entries ({missing:,} missing)")
-    return selected, missing
+    return selected, missing, diagnostics
 
 
 class ImageNetParquetDataset(Dataset):

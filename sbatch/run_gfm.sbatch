@@ -85,7 +85,7 @@
 # Overridable via the environment:
 #   DATA_ROOT_CIFAR10, DATA_ROOT_IMAGENET, WORK_DIR, HF_HOME, TORCH_HOME,
 #   BATCH_SIZE, MICRO_BATCH, EPOCHS, EVAL_SAMPLES, REF_IMAGES, GFM_VARIANTS,
-#   IMAGENET_LT_SPLIT, GFM_CACHE_DIR
+#   IMAGENET_LT_SPLIT, GFM_CACHE_DIR, GFM_ALLOW_PARETO
 #
 # -----------------------------------------------------------------------------
 # GPU MEMORY -- why BATCH_SIZE is not what has to fit.
@@ -324,6 +324,17 @@ if [ "$DATASET" == "imagenet-lt" ] && [ "$NEEDS_RAW" -eq 1 ]; then
         # --no_pareto_fallback: with a real split file in hand, a silent
         # reconstruction can only mean something went wrong. Fail instead.
         LT_EXTRA=(--imagenet_lt_split_file "$IMAGENET_LT_SPLIT" --no_pareto_fallback)
+        # Escape hatch for the one case where the guard is wrong: parquet shards
+        # that do not carry the original ImageNet filenames, so the official
+        # split cannot be matched onto them however hard we try. Opting in is
+        # deliberate -- the resulting numbers are NOT comparable to published
+        # ImageNet-LT results, and the run records that in its metadata.
+        if [ "${GFM_ALLOW_PARETO:-0}" == "1" ]; then
+            LT_EXTRA=(--imagenet_lt_split_file "$IMAGENET_LT_SPLIT")
+            echo "[data] WARNING: GFM_ALLOW_PARETO=1 -- a reconstructed split is" >&2
+            echo "       allowed. Same long-tailed profile, different image list;" >&2
+            echo "       results are not comparable to published ImageNet-LT." >&2
+        fi
     else
         echo "[data] WARNING: no local ImageNet_LT_train.txt found." >&2
         echo "       The loader will try to download it; if this node has no" >&2

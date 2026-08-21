@@ -460,6 +460,26 @@ def shot_groups(class_counts, many_thr=100, few_thr=20):
     return {"many": sorted(many), "medium": sorted(medium), "few": sorted(few)}
 
 
+def has_wnid_tree(root_dir, split="train"):
+    """True if `root_dir` holds the JPEG folder tree (wnid directories).
+
+    Checked directly and under the split subdirectory, since both layouts are
+    in the wild. A wnid is 'n' plus 8 digits, e.g. n01440764.
+    """
+    import re
+    wnid = re.compile("^n[0-9]{8}$")
+    for base in (os.path.join(root_dir, split), root_dir):
+        if not os.path.isdir(base):
+            continue
+        try:
+            for entry in os.scandir(base):
+                if entry.is_dir() and wnid.match(entry.name):
+                    return True
+        except OSError:
+            continue
+    return False
+
+
 def build_imagenet_lt_parquet(root_dir, split="train", image_size=256,
                               use_horizontal_flips=True, return_label=True,
                               split_file=None, split_dir=None,
@@ -491,17 +511,33 @@ def build_imagenet_lt_parquet(root_dir, split="train", image_size=256,
 
     if split_file and os.path.exists(split_file) and have_names:
         samples = read_lt_split_file(split_file)
-        selected, missing = match_split_to_rows(rows, samples)
+        selected, missing, diag = match_split_to_rows(rows, samples)
         frac = missing / max(1, len(samples))
         if frac > 0.02:
+            shard_examples = "".join(
+                f"      {n}\n" for n in diag["shard_names"]) or "      (none)\n"
+            split_examples = "".join(
+                f"      {n}\n" for n in diag["unmatched_split_names"])
             raise SystemExit(
                 f"\n[data error] only {len(selected):,}/{len(samples):,} "
                 f"ImageNet-LT entries matched rows in the parquet shards "
                 f"({frac:.1%} missing).\n"
-                f"The filenames in the shards probably do not correspond to the "
-                f"original ImageNet ones.\n"
-                f"Inspect them with:\n"
-                f"    python datasets/inspect_parquet.py --root {root_dir}\n")
+                f"Matching is on the lowercased, extension-less basename, so an "
+                f"extension or case difference is already absorbed -- these "
+                f"shards name their rows differently:\n"
+                f"    names in the shards ({diag['n_named_rows']:,} distinct):\n"
+                f"{shard_examples}"
+                f"    names the split asked for:\n"
+                f"{split_examples}"
+                f"\nThree ways forward:\n"
+                f"  1. encode from a JPEG-folder ImageNet instead, if the "
+                f"cluster has one (the wnid directories);\n"
+                f"  2. accept a reconstructed split -- same long-tailed profile, "
+                f"different image list, NOT comparable to published "
+                f"ImageNet-LT numbers -- by dropping --no_pareto_fallback "
+                f"(from Slurm: GFM_ALLOW_PARETO=1 sbatch ...);\n"
+                f"  3. look at the shards yourself:\n"
+                f"       python datasets/inspect_parquet.py --root {root_dir}\n")
         source = f"official:{os.path.basename(split_file)}+parquet"
     elif not have_names:
         if not allow_pareto_fallback:
@@ -593,7 +629,15 @@ def build_image_dataset(name, root_dir, split="train", image_size=256,
     if name in ("imagenet-lt", "imagenet_lt", "imnet-lt"):
         check_dataset_root(root_dir, "ImageNet-LT", "DATA_ROOT_IMAGENET")
         from datasets.imagenet_parquet import is_parquet_dir
-        if is_parquet_dir(root_dir):
+        # ImageNet-LT is 115,846 images named one by one, so the folder tree is
+        # strictly better than parquet here: the official split addresses files
+        # by name, which the tree always satisfies and shards only sometimes do.
+        # (Full ImageNet takes every row, so it has no such preference.)
+        if is_parquet_dir(root_dir) and has_wnid_tree(root_dir, split):
+            print(f"[data] {root_dir} has BOTH parquet shards and the wnid "
+                  f"folder tree -- using the tree, which the official "
+                  f"ImageNet-LT split can address by filename")
+        elif is_parquet_dir(root_dir):
             return build_imagenet_lt_parquet(
                 root_dir, split=split, image_size=image_size,
                 use_horizontal_flips=use_horizontal_flips,
