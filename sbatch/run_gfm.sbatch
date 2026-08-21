@@ -1,4 +1,7 @@
 #!/bin/bash
+# Placeholder only -- the script renames the job to gfm-<dataset>-<phase> once
+# it can see its arguments (see the "job name" section below). Submitting via
+# sbatch/submit.sh sets the final name up front, which also names the logs.
 #SBATCH --job-name=gfm
 #SBATCH --output=sbatch/logs/%x_%j.out
 #SBATCH --error=sbatch/logs/%x_%j.err
@@ -41,6 +44,11 @@
 # Submit from the REPO ROOT; every path below is relative to the submit dir.
 #
 #   sbatch sbatch/run_gfm.sbatch <dataset> [phase] [extra run_pipeline args...]
+#
+# Every job renames itself to gfm-<dataset>-<phase> (gfm-inlt-erte,
+# gfm-in1k-trn, gfm-c10-all), so squeue can tell concurrent runs apart. Widen
+# the NAME column, which defaults to 8 characters:
+#   squeue -u $USER -o '%.10i %.20j %.2t %.11M %.6D %R'
 #
 #   dataset : cifar10 | imagenet | imagenet-lt
 #   phase   : all (default) | warmup | encode | reference | train | evaluate
@@ -176,6 +184,53 @@ case "$DATASET" in
 esac
 
 mkdir -p sbatch/logs
+
+# --- job name -----------------------------------------------------------------
+# The #SBATCH --job-name above is a placeholder: the dataset and phase are
+# positional arguments, which Slurm has not seen when it reads the directives.
+# So build the real name here and rename the job through scontrol -- squeue
+# shows "gfm-inlt-enc" instead of five identical "gfm" rows.
+#
+# Submitting through sbatch/submit.sh sets the name at SUBMISSION time instead
+# (-J), which is better: it is already right while the job is PENDING, and the
+# log files pick it up too, since Slurm expands %x when it opens them.
+#
+# NOTE: squeue truncates NAME to 8 characters in its default format. Widen it:
+#     squeue -u $USER -o '%.10i %.20j %.2t %.11M %.6D %R'
+#     alias sq='squeue -u $USER -o "%.10i %.20j %.2t %.11M %.6D %R"'
+case "$DATASET" in
+    cifar10)     _ds=c10 ;;
+    imagenet)    _ds=in1k ;;
+    imagenet-lt) _ds=inlt ;;
+    *)           _ds="$DATASET" ;;
+esac
+# One phase -> a 3-letter abbreviation; several -> their initials (encode,
+# reference,train,evaluate becomes 'erte'), which stays inside squeue's column.
+case "$PHASE" in
+    encode)    _ph=enc ;;
+    reference) _ph=ref ;;
+    train)     _ph=trn ;;
+    evaluate)  _ph=evl ;;
+    warmup)    _ph=wrm ;;
+    report)    _ph=rpt ;;
+    all)       _ph=all ;;
+    sweep)     _ph=swp ;;
+    *)         _ph="$(echo "$PHASE" | tr ',' '\n' | cut -c1 | tr -d '\n')" ;;
+esac
+JOB_LABEL="gfm-${_ds}-${_ph}"
+
+# Do not fight an explicit -J: if the name is neither the placeholder nor one
+# we generated, the submitter chose it deliberately.
+if [ -n "${SLURM_JOB_ID:-}" ] && command -v scontrol >/dev/null 2>&1; then
+    case "${SLURM_JOB_NAME:-gfm}" in
+        gfm|run_gfm.sbatch|gfm-*)
+            if scontrol update "JobId=$SLURM_JOB_ID" "Name=$JOB_LABEL" 2>/dev/null; then
+                echo "[slurm] job name: ${JOB_LABEL}  (${DATASET} / ${PHASE})"
+            fi ;;
+        *) echo "[slurm] keeping explicit job name: ${SLURM_JOB_NAME}" ;;
+    esac
+fi
+
 
 # --- environment: ACTIVATE YOUR VENV -------------------
 # (If Python is not found, uncomment the module load line too)

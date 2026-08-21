@@ -226,6 +226,25 @@ sbatch --time=72:00:00 sbatch/run_gfm.sbatch imagenet   # longer budget
 sbatch sbatch/run_gfm.sbatch cifar10 sweep              # graph-correction ablation
 ```
 
+**Job names.** Every job names itself `gfm-<dataset>-<phase>` --
+`gfm-inlt-erte`, `gfm-in1k-trn`, `gfm-c10-all` -- so parallel runs are
+distinguishable in `squeue` instead of being five identical `gfm` rows. The
+dataset abbreviates to `c10` / `in1k` / `inlt`; a single phase to three letters
+(`enc`, `ref`, `trn`, `evl`, `wrm`, `rpt`, `all`, `swp`), several to their
+initials (`encode,reference,train,evaluate` -> `erte`).
+
+Slurm cannot see the positional arguments when it reads the `#SBATCH`
+directives, so plain `sbatch` submissions rename themselves at startup via
+`scontrol`; `sbatch/submit.sh` sets the name at submission instead, which is
+better -- it is right while the job is still PENDING, and the log files are
+named after it too. An explicit `-J` always wins.
+
+`squeue` truncates NAME to 8 characters by default, so widen it:
+
+```bash
+alias sq='squeue -u $USER -o "%.10i %.20j %.2t %.11M %.6D %R"'
+```
+
 **Node exclusion.** `run_gfm.sbatch` deliberately does *not* carry an
 `#SBATCH --exclude` directive: Slurm validates node names at submission time and
 rejects the whole job if one is stale (`Invalid node name specified`). Use the

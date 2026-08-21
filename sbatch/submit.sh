@@ -44,6 +44,16 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --dry-run) DRY_RUN=1; shift ;;
         --check)   CHECK_ONLY=1; shift ;;
+        # sbatch options whose value can be a SEPARATE argument. Without this
+        # the value is left in place and read as the dataset, so
+        # 'submit.sh -J mine cifar10' would submit dataset 'mine'.
+        # The --opt=value form needs nothing special; it matches -* below.
+        -J|-t|-p|-A|-q|-w|-x|-C|-G|-c|-N|-n|-o|-e|-d|-M|        --job-name|--time|--partition|--account|--qos|--nodelist|--exclude|        --constraint|--gpus|--cpus-per-task|--nodes|--ntasks|--output|--error|        --dependency|--clusters|--mem|--gres|--reservation)
+            if [ $# -ge 2 ]; then
+                SBATCH_OPTS+=("$1" "$2"); shift 2
+            else
+                echo "ERROR: $1 needs a value" >&2; exit 2
+            fi ;;
         -*)        SBATCH_OPTS+=("$1"); shift ;;
         *)         break ;;
     esac
@@ -111,6 +121,32 @@ if [ -n "$ALL_FEATURES" ]; then
 fi
 
 [ "$CHECK_ONLY" -eq 1 ] && exit 0
+
+# ---- 2b. a job name squeue can tell apart ----------------------------------
+# Set at submission so it is already correct while the job is PENDING, and so
+# Slurm expands %x in the log filenames to it. The job script derives the same
+# name at runtime for plain 'sbatch' submissions; an explicit -J here wins over
+# both.
+HAVE_NAME=0
+for opt in ${SBATCH_OPTS[@]+"${SBATCH_OPTS[@]}"}; do
+    case "$opt" in -J|-J*|--job-name|--job-name=*) HAVE_NAME=1 ;; esac
+done
+if [ "$HAVE_NAME" -eq 0 ] && [ $# -ge 1 ]; then
+    case "$1" in
+        cifar10)     ds=c10 ;;
+        imagenet)    ds=in1k ;;
+        imagenet-lt) ds=inlt ;;
+        *)           ds="$1" ;;
+    esac
+    case "${2:-all}" in
+        encode) ph=enc ;; reference) ph=ref ;; train) ph=trn ;;
+        evaluate) ph=evl ;; warmup) ph=wrm ;; report) ph=rpt ;;
+        all) ph=all ;; sweep) ph=swp ;;
+        *) ph="$(echo "${2:-all}" | tr ',' '\n' | cut -c1 | tr -d '\n')" ;;
+    esac
+    SBATCH_OPTS+=("--job-name=gfm-${ds}-${ph}")
+    echo "job name: gfm-${ds}-${ph}  (squeue -u \$USER -o '%.10i %.20j %.2t %.11M %.6D %R')"
+fi
 
 # ---- 3. submit -------------------------------------------------------------
 CMD=(sbatch)
