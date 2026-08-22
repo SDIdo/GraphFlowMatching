@@ -467,7 +467,9 @@ contributing without destabilising training.
   \centering
   \small
   \safeinput{generated/loss_table.tex}
-  \caption{Training summary per dataset.}
+  \caption{Training summary per dataset. ``Train (h)'' is cumulative over the
+  whole run, so a training split over several chained jobs still reports one
+  figure.}
   \label{tab:loss}
 \end{table}
 
@@ -486,11 +488,15 @@ by the real set's statistics and is therefore on a comparable scale across rows.
   \centering
   \small
   \safeinput{generated/results_table.tex}
-  \caption{Generative quality. FID and MMD lower is better; IS higher is better.
-  MMD is $\sqrt{\max(\widehat{\mathrm{MMD}}^2_u,0)}$ on standardised Inception
-  features (\cref{eq:mmd}). ``Res.'' is the resolution the metrics were computed
-  at: $32$ for CIFAR-10 (standard protocol) and $256$ for the ImageNet
-  variants.}
+  \caption{Generative quality and what it cost. FID and MMD lower is better; IS
+  higher is better. MMD is $\sqrt{\max(\widehat{\mathrm{MMD}}^2_u,0)}$ on
+  standardised Inception features (\cref{eq:mmd}). ``Res.'' is the resolution the
+  metrics were computed at: $32$ for CIFAR-10 (standard protocol) and $256$ for
+  the ImageNet variants. ``Train'' is single-GPU wall-clock training time, summed
+  over the whole run even where it was split across chained jobs and excluding
+  the time those jobs spent queued; ``Infer'' is the time to sample the
+  $N_{\text{gen}}$ images at the solver step count of \cref{tab:config}, with
+  metric computation excluded.}
   \label{tab:results}
 \end{table}
 

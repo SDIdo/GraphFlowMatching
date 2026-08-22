@@ -457,28 +457,61 @@ sbatch --dependency=afterany:<last-id> sbatch/run_gfm.sbatch imagenet-lt evaluat
 bash sbatch/chain.sh 4 --time=03:55:00 --dependency=afterany:<encode-id>     imagenet-lt train
 ```
 
-**The 25-epoch runs, all three datasets, under a 4 h cap.** One command builds
-the whole dependency graph -- `warmup` once, then per dataset
-`encode`[`,reference`] -> N chained `train` links of 3 h 55 -> `evaluate`, and a
-final `all report`:
+**The 25-epoch runs, all three datasets, under a 4 h cap.** One submission
+does everything -- three datasets to 25 epochs, evaluation, and the report:
+
+```bash
+sbatch sbatch/run_all25.sbatch
+```
+
+That expands into a three-task job array, one dataset per task, running in
+parallel. Each task works until Slurm kills it at 3 h 55, and **submits its own
+successor before it starts**, so training simply continues for as long as it
+needs; the successor resumes from `train_state.pt`. When a task finds its
+dataset at 25 epochs it evaluates it, and the last task to finish builds the
+report. A link with nothing left to do exits in seconds without submitting
+anything, which is how the chain ends -- there is exactly one no-op job per
+dataset at the end, and no link count to guess.
+
+```bash
+squeue -u $USER -o '%.10i %.20j %.2t %.11M %.20E %R'   # NAME shows the stage
+tail -f sbatch/logs/gfm25_*.out
+touch $WORK_DIR/.gfm25/stop                            # stop after the current links
+```
+
+It re-checks the artefacts every link, so a dataset that is already encoded, or
+already trained by an earlier attempt, is not redone; resubmitting the same
+command over finished work runs no stage at all. Two guards keep a broken run
+from burning the queue: `GFM_MAX_STALLS` (default 3) stops a dataset whose
+links make no measurable progress -- a crash loop, as opposed to slow training,
+which still advances the step counter -- and `GFM_MAX_LINKS` (default 60) caps
+the chain outright. A dataset that gives up still lets the report be built,
+showing `--` for what it never produced. `GFM_DATASETS` and `--array` select a
+subset:
+
+```bash
+GFM_DATASETS=cifar10 sbatch --array=0 sbatch/run_all25.sbatch
+```
+
+`sbatch/run25.sh` is the alternative for a cluster where a job may not submit
+jobs: it pre-submits a fixed chain from the login node, and therefore has to
+*guess* the link count (2 / 4 / 28 for CIFAR-10 / ImageNet-LT / ImageNet,
+sized for the slowest card the constraint allows).
 
 ```bash
 bash sbatch/run25.sh                 # cifar10 + imagenet-lt + imagenet
 bash sbatch/run25.sh --dry-run       # print the graph, submit nothing
-bash sbatch/run25.sh cifar10         # one dataset
 
 # fewer links (and a third of the wall-clock) by pinning the fast cards
 EXTRA=--constraint=rtx_pro_6000 LINKS_IMAGENET=8 bash sbatch/run25.sh imagenet
 ```
 
-Defaults are `EPOCHS=25`, `LINK_TIME=03:55:00` and 2 / 4 / 28 train links for
-CIFAR-10 / ImageNet-LT / ImageNet -- sized for the slowest card the job
-constraint allows, so they are upper bounds. Extra links are nearly free (the
-epoch loop is empty and the job exits in minutes), a chain that runs short is
-not, so over-provision. `SKIP_WARMUP=1 SKIP_ENCODE=1` resubmits just the
-training and evaluation after a failure. The one stage that cannot be chained
-is `encode`, which has no resume: for ImageNet it gets its own job with
-`ENCODE_CPUS=32` cores, because JPEG decode is what makes it 2-4 h.
+Extra links there are nearly free (the epoch loop is empty and the job exits in
+minutes) and a chain that runs short is not, so over-provision;
+`SKIP_WARMUP=1 SKIP_ENCODE=1` resubmits just training and evaluation. Either
+way, the one stage that cannot be chained is `encode`, which has no resume: it
+gets 16 CPUs in `run_all25.sbatch` and its own 32-CPU job in `run25.sh`,
+because JPEG decode is what makes ImageNet encode 2-4 h.
 
 Each link resubmits the same command with `--dependency=afterany` on the
 previous one -- `afterany`, not `afterok`, because a link that TIMEOUTs exits
@@ -506,7 +539,23 @@ bash sbatch/run_gfm.sbatch cifar10 report
 ```
 
 `report` scans `WORK_DIR`, finds every run, and rebuilds the figures and tables
-from all of them at once; datasets that have not finished show as `--`.
+from all of them at once; datasets that have not finished show as `--`. It also
+prints a plain-text summary of every run -- FID, IS, epochs, training hours,
+inference minutes -- so the numbers are readable straight from the job log.
+
+**Where the timings come from.** The results table carries two wall-clock
+columns beside the metrics:
+
+| Column | Source | Covers |
+| --- | --- | --- |
+| `Train (h)` | `wall_time_s` in `train_log_epochs.csv` | The whole run. On a resume the logger seeds its clock from the largest value already in the CSV, so a training split over 28 chained jobs reports one cumulative figure rather than the last link's. Time spent queued between links is not counted. |
+| `Infer (min)` | `timing.sampling_s` in `metrics.json` | Sampling the `N_gen` images -- ODE integration, VAE decode, PNG write. Metric computation is excluded and lives in `timing.metrics_s`; `timing.total_s` is the whole `evaluate` stage. |
+
+`metrics.json` also records `timing.ms_per_image` and `timing.nfe_per_image`,
+which is the pair to quote when comparing sampling cost across solvers or step
+counts. Re-running `evaluate` with `--reuse_samples` leaves `sampling_s` null
+and the table cell `--`: that run did not pay the sampling cost, and a `0` would
+read as though inference were free.
 
 Two stages are *not* safe to run concurrently, which is why the parallel
 submissions above stop at `evaluate`: `plot` and `paper` are global rather than

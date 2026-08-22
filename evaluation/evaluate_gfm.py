@@ -112,6 +112,12 @@ def parse_args(argv=None):
 # --------------------------------------------------------------------------- #
 #  Sampling
 # --------------------------------------------------------------------------- #
+def _fmt_hms(seconds):
+    """Seconds as h:mm:ss -- these timings span minutes to hours."""
+    seconds = int(round(float(seconds)))
+    return f"{seconds // 3600:d}:{(seconds % 3600) // 60:02d}:{seconds % 60:02d}"
+
+
 def load_decoder(args):
     dec_path = os.path.join(args.model_savepath, "hf_decoder_wrapper.pt")
     if os.path.exists(dec_path):
@@ -126,7 +132,12 @@ def load_decoder(args):
 
 @torch.no_grad()
 def sample_images(args, vel_net, decoder, out_dir):
-    """Integrate the learned velocity field and write PNGs at eval resolution."""
+    """Integrate the learned velocity field and write PNGs at eval resolution.
+
+    Returns (out_dir, elapsed_seconds). That elapsed time IS the inference
+    cost of the run -- ODE integration, VAE decode and PNG write -- and is
+    what metrics.json and the report tables report.
+    """
     from utils.utils import integrate_ode
 
     os.makedirs(out_dir, exist_ok=True)
@@ -165,7 +176,11 @@ def sample_images(args, vel_net, decoder, out_dir):
         el = time.time() - t0
         print(f"[sample] {written}/{args.num_samples}  "
               f"({written / max(el, 1e-6):.1f} img/s)", flush=True)
-    return out_dir
+    elapsed = time.time() - t0
+    print(f"[sample] {written} images in {_fmt_hms(elapsed)}  "
+          f"({1000.0 * elapsed / max(written, 1):.1f} ms/img at "
+          f"{args.nsteps} NFE)")
+    return out_dir, elapsed
 
 
 def save_sample_grid(sample_dir, out_path, rows=8, cols=8):
@@ -202,6 +217,10 @@ def main(argv=None):
         print("[warn] CUDA requested but unavailable -> falling back to CPU")
         args.device = "cpu"
 
+    t_eval0 = time.time()
+    # None, not 0.0, when the samples are reused: that cost was paid by an
+    # earlier job, and a zero here would read as 'sampling was free'.
+    sampling_s = None
     have = len(M.list_images(args.sample_dir)) if os.path.isdir(args.sample_dir) else 0
     if args.reuse_samples and have >= args.num_samples:
         print(f"[sample] reusing {have} existing images in {args.sample_dir}")
@@ -216,7 +235,7 @@ def main(argv=None):
         print(f"[model] {n_params/1e6:.2f}M parameters")
         decoder = load_decoder(args)
         decoder.eval()
-        sample_images(args, vel_net, decoder, args.sample_dir)
+        _, sampling_s = sample_images(args, vel_net, decoder, args.sample_dir)
         del vel_net, decoder
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -239,6 +258,17 @@ def main(argv=None):
         "sample_dir": os.path.abspath(args.sample_dir),
         "sample_grid": grid_path,
     }
+
+    # metrics_s and total_s are filled in at the very end, once the metric
+    # phase has run; the dict is in results already, so it is one object.
+    timing = {
+        "sampling_s": sampling_s,
+        "samples_reused": sampling_s is None,
+        "ms_per_image": (None if sampling_s is None else
+                         1000.0 * sampling_s / max(args.num_samples, 1)),
+        "nfe_per_image": args.nsteps,
+    }
+    results["timing"] = timing
 
     # ---------------- FID ----------------
     if not args.skip_fid:
@@ -338,8 +368,17 @@ def main(argv=None):
         except Exception as exc:  # noqa: BLE001
             print(f"[t-SNE] skipped ({exc})")
 
+    total_s = time.time() - t_eval0
+    timing["metrics_s"] = total_s - (sampling_s or 0.0)
+    timing["total_s"] = total_s
+
     out_json = os.path.join(args.out_dir, "metrics.json")
     M.save_json(results, out_json)
+    print()
+    print(f"[time] sampling {args.num_samples} images: "
+          f"{'reused' if sampling_s is None else _fmt_hms(sampling_s)}   "
+          f"metrics: {_fmt_hms(timing['metrics_s'])}   "
+          f"total: {_fmt_hms(total_s)}")
     print(f"\n[done] metrics -> {out_json}")
     print(json.dumps({k: v for k, v in results.items()
                       if k in ("fid", "inception_score", "inception_score_std")},

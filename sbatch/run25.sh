@@ -3,6 +3,12 @@
 # Submit the whole 25-epoch pipeline for cifar10, imagenet-lt and imagenet
 # under a hard 4 h wall-clock cap.
 #
+# CONSIDER sbatch/run_all25.sbatch INSTEAD
+#   That one is a single `sbatch` and needs no link count at all: each link
+#   submits its own successor and the chain stops when the work is done. Use
+#   THIS script when a job may not submit jobs on your cluster, or when you
+#   want the whole graph visible in squeue the moment you press enter.
+#
 # WHY THIS EXISTS
 #   25 epochs is more than 4 h of training on every one of these datasets
 #   except CIFAR-10 on a fast card, so no single job can finish one. This
@@ -75,7 +81,7 @@ DATASETS=()
 for arg in "$@"; do
     case "$arg" in
         --dry-run) DRY_RUN=1 ;;
-        -h|--help) sed -n '2,68p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,73p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         cifar10|imagenet|imagenet-lt) DATASETS+=("$arg") ;;
         *) echo "ERROR: unknown argument '$arg' (cifar10|imagenet|imagenet-lt|--dry-run)" >&2; exit 2 ;;
     esac
