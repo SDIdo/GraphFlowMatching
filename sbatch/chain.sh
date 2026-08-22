@@ -34,6 +34,11 @@
 #   Arguments are forwarded to sbatch/submit.sh, so node exclusion and the
 #   gfm-<dataset>-<phase> job naming work exactly as they do there.
 #
+#   A --dependency you pass is applied to link 1 only -- use it to hang the
+#   whole chain off an earlier job, e.g. the encode:
+#       bash sbatch/chain.sh 4 --time=03:55:00 #           --dependency=afterany:<encode-id> imagenet-lt train
+#   Links 2..N always depend on the link before them, never on that job.
+#
 # BEFORE YOU CHAIN, check what the cap actually is -- one long job is always
 # better than a chain:
 #   sinfo -o '%20P %10l %10L'                  # partition MaxTime / DefaultTime
@@ -59,6 +64,25 @@ if [ "$LINKS" -lt 1 ] || [ "$LINKS" -gt 100 ]; then
     exit 2
 fi
 
+# A --dependency the caller passes ("start the chain after the encode job")
+# belongs to link 1 ONLY. Links 2..N must wait on the previous link instead.
+# sbatch takes the LAST --dependency on the command line, so leaving the
+# caller's copy in the forwarded arguments would override the one this script
+# adds and every link would start at once, all writing the same train_state.pt.
+USER_DEP=""
+ARGS=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -d|--dependency)
+            if [ $# -lt 2 ]; then echo "ERROR: $1 needs a value" >&2; exit 2; fi
+            USER_DEP="$2"; shift 2 ;;
+        --dependency=*) USER_DEP="${1#--dependency=}"; shift ;;
+        -d?*)           USER_DEP="${1#-d}"; shift ;;
+        *)              ARGS+=("$1"); shift ;;
+    esac
+done
+set -- ${ARGS[@]+"${ARGS[@]}"}
+
 echo "chaining ${LINKS} dependent job(s): $*"
 echo
 
@@ -68,7 +92,11 @@ for i in $(seq 1 "$LINKS"); do
     # printing, on failure the whole thing is what explains it.
     OK=0
     if [ -z "$PREV" ]; then
-        OUT="$(bash sbatch/submit.sh "$@" 2>&1)" || OK=$?
+        if [ -n "$USER_DEP" ]; then
+            OUT="$(bash sbatch/submit.sh "--dependency=$USER_DEP" "$@" 2>&1)" || OK=$?
+        else
+            OUT="$(bash sbatch/submit.sh "$@" 2>&1)" || OK=$?
+        fi
     else
         OUT="$(bash sbatch/submit.sh "--dependency=afterany:$PREV" "$@" 2>&1)" || OK=$?
     fi
@@ -86,7 +114,11 @@ for i in $(seq 1 "$LINKS"); do
         exit 1
     fi
     if [ -z "$PREV" ]; then
-        echo "  link ${i}: ${ID}"
+        if [ -n "$USER_DEP" ]; then
+            echo "  link ${i}: ${ID}  (starts after ${USER_DEP})"
+        else
+            echo "  link ${i}: ${ID}"
+        fi
     else
         echo "  link ${i}: ${ID}  (starts after ${PREV})"
     fi

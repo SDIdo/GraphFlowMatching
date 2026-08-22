@@ -451,7 +451,34 @@ bash sbatch/chain.sh 17 --time=04:00:00 imagenet-lt train
 
 # then evaluate once, at the end
 sbatch --dependency=afterany:<last-id> sbatch/run_gfm.sbatch imagenet-lt evaluate
+
+# a --dependency passed to chain.sh applies to link 1 only, so a chain can
+# start after the encode job; links 2..N still wait on the link before them
+bash sbatch/chain.sh 4 --time=03:55:00 --dependency=afterany:<encode-id>     imagenet-lt train
 ```
+
+**The 25-epoch runs, all three datasets, under a 4 h cap.** One command builds
+the whole dependency graph -- `warmup` once, then per dataset
+`encode`[`,reference`] -> N chained `train` links of 3 h 55 -> `evaluate`, and a
+final `all report`:
+
+```bash
+bash sbatch/run25.sh                 # cifar10 + imagenet-lt + imagenet
+bash sbatch/run25.sh --dry-run       # print the graph, submit nothing
+bash sbatch/run25.sh cifar10         # one dataset
+
+# fewer links (and a third of the wall-clock) by pinning the fast cards
+EXTRA=--constraint=rtx_pro_6000 LINKS_IMAGENET=8 bash sbatch/run25.sh imagenet
+```
+
+Defaults are `EPOCHS=25`, `LINK_TIME=03:55:00` and 2 / 4 / 28 train links for
+CIFAR-10 / ImageNet-LT / ImageNet -- sized for the slowest card the job
+constraint allows, so they are upper bounds. Extra links are nearly free (the
+epoch loop is empty and the job exits in minutes), a chain that runs short is
+not, so over-provision. `SKIP_WARMUP=1 SKIP_ENCODE=1` resubmits just the
+training and evaluation after a failure. The one stage that cannot be chained
+is `encode`, which has no resume: for ImageNet it gets its own job with
+`ENCODE_CPUS=32` cores, because JPEG decode is what makes it 2-4 h.
 
 Each link resubmits the same command with `--dependency=afterany` on the
 previous one -- `afterany`, not `afterok`, because a link that TIMEOUTs exits

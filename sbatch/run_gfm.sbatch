@@ -159,7 +159,15 @@
 # --state_every_steps and at every epoch boundary, and --resume auto (the
 # default) continues from it. At most one epoch of work is repeated.
 #
-# When the run is longer than the cluster's wall-clock cap, chain it:
+# THE 25-EPOCH RUN UNDER A 4 h CAP -- one command for all three datasets:
+#     bash sbatch/run25.sh
+# It submits warmup once, then per dataset encode[,reference] -> N chained
+# train links of 3h55 -> evaluate, and a final 'all report'. Link counts,
+# EPOCHS and the per-link --time are environment variables; see the header of
+# sbatch/run25.sh, which also explains why the ImageNet encode gets its own
+# job with more cores (encode is the one stage that cannot resume).
+#
+# When the run is longer than the cluster's wall-clock cap, chain it by hand:
 #     bash sbatch/chain.sh 17 --time=04:00:00 imagenet-lt train
 # which submits 17 jobs, each depending (afterany) on the previous one. Check
 # the cap first -- one long job is always better:
