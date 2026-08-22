@@ -159,12 +159,13 @@
 # --state_every_steps and at every epoch boundary, and --resume auto (the
 # default) continues from it. At most one epoch of work is repeated.
 #
-# THE 25-EPOCH RUN UNDER A 4 h CAP -- one submission for all three datasets:
-#     sbatch sbatch/run_all25.sbatch
-# A three-task array, one dataset each, where every link submits its own
-# successor before it starts working and the chain ends when the work is done:
-# no link count to guess, training runs for as long as it needs, evaluation
-# follows, and the last dataset to finish builds the report. See its header.
+# THE 25-EPOCH RUN UNDER A 4 h CAP -- one command for all three datasets:
+#     bash sbatch/start25.sh
+# It submits one self-chaining job per dataset -- gfm-c10, gfm-inlt, gfm-in1k,
+# three separate lines in squeue. Every link submits its own successor before
+# it starts working, so training runs for as long as it needs with no link
+# count to guess; the link that reaches 25 epochs evaluates in the same job,
+# and the last dataset to finish builds the report. See sbatch/run_all25.sbatch.
 #
 # sbatch/run25.sh does the same with a fixed, pre-submitted chain, for a
 # cluster where a job may not submit jobs.

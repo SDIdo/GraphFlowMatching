@@ -29,7 +29,10 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."     # repo root
-SCRIPT="sbatch/run_gfm.sbatch"
+# Which job script to submit. run_gfm.sbatch runs one stage and exits;
+# sbatch/start25.sh points this at run_all25.sbatch so a self-chaining
+# job gets the same node-exclusion validation as everything else.
+SCRIPT="${GFM_SUBMIT_SCRIPT:-sbatch/run_gfm.sbatch}"
 
 # Nodes we would like to avoid. Edit here, not in run_gfm.sbatch.
 WANT_EXCLUDE="cs-1080-[01-05],cs-2080-[01-05],cs-cpu-[05-11],cs-cpu256-01,cs-pheno-[01-12],dt-2080-[01-19],ee-l40s-[01-02],ise-1080-01,ise-2080-[01-03],ise-cpu-intl-[01-28],ise-cpu128-[01-09],ise-cpu128-[11-14],ise-cpu256-[01-32],ise-pheno-[01-12]"

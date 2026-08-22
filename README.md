@@ -457,27 +457,52 @@ sbatch --dependency=afterany:<last-id> sbatch/run_gfm.sbatch imagenet-lt evaluat
 bash sbatch/chain.sh 4 --time=03:55:00 --dependency=afterany:<encode-id>     imagenet-lt train
 ```
 
-**The 25-epoch runs, all three datasets, under a 4 h cap.** One submission
-does everything -- three datasets to 25 epochs, evaluation, and the report:
+**The 25-epoch runs, all three datasets, under a 4 h cap.** One command does
+everything -- three datasets to 25 epochs, evaluation, and the report:
 
 ```bash
-sbatch sbatch/run_all25.sbatch
+bash sbatch/start25.sh
 ```
 
-That expands into a three-task job array, one dataset per task, running in
-parallel. Each task works until Slurm kills it at 3 h 55, and **submits its own
-successor before it starts**, so training simply continues for as long as it
-needs; the successor resumes from `train_state.pt`. When a task finds its
-dataset at 25 epochs it evaluates it, and the last task to finish builds the
-report. A link with nothing left to do exits in seconds without submitting
-anything, which is how the chain ends -- there is exactly one no-op job per
-dataset at the end, and no link count to guess.
+It submits **one ordinary job per dataset**, so squeue shows three lines you can
+tell apart:
+
+```
+JOBID     NAME             ST  TIME
+4812345   gfm-c10-trn      R   1:12:03
+4812346   gfm-inlt-trn     R   1:11:58
+4812347   gfm-in1k-enc     R   0:41:22
+```
+
+The suffix is the stage running right now -- `run_gfm.sbatch` renames the job as
+each stage starts (`enc` / `ref` / `trn` / `evl` / `rpt`), so the NAME column is
+a live progress display.
+
+Each job works until Slurm kills it at 3 h 55 and **submits its own successor
+before it starts**, so training continues for as long as it needs; the successor
+resumes from `train_state.pt`. The link that reaches 25 epochs goes straight on
+to `evaluate` **in the same job** -- only if it is nearly out of wall clock does
+it leave that to its successor, since sampling cannot resume. The last dataset
+to finish builds the report. A link with nothing left to do exits in seconds
+without submitting anything, which is how the chain ends: exactly one no-op job
+per dataset, and no link count to guess.
 
 ```bash
 squeue -u $USER -o '%.10i %.20j %.2t %.11M %.20E %R'   # NAME shows the stage
-tail -f sbatch/logs/gfm25_*.out
+tail -f sbatch/logs/gfm-c10_*.out
 touch $WORK_DIR/.gfm25/stop                            # stop after the current links
+
+bash sbatch/start25.sh cifar10 imagenet-lt             # a subset
+bash sbatch/start25.sh --dry-run                       # print, submit nothing
+sbatch sbatch/run_all25.sbatch imagenet                # one dataset, by hand
 ```
+
+If a job sits in `PD` and you want to know why, the REASON column that
+`start25.sh` prints after submitting is the answer: `Priority` / `Resources`
+means it is queued behind other work and will start, while `BadConstraints` or
+`ReqNodeNotAvail` means it never will. The jobs ask for exactly what
+`run_gfm.sbatch` asks for -- 8 CPUs, 64 G, one GPU of the four constrained
+types -- so anything that schedules for a normal stage job schedules for these.
 
 It re-checks the artefacts every link, so a dataset that is already encoded, or
 already trained by an earlier attempt, is not redone; resubmitting the same
@@ -486,12 +511,7 @@ from burning the queue: `GFM_MAX_STALLS` (default 3) stops a dataset whose
 links make no measurable progress -- a crash loop, as opposed to slow training,
 which still advances the step counter -- and `GFM_MAX_LINKS` (default 60) caps
 the chain outright. A dataset that gives up still lets the report be built,
-showing `--` for what it never produced. `GFM_DATASETS` and `--array` select a
-subset:
-
-```bash
-GFM_DATASETS=cifar10 sbatch --array=0 sbatch/run_all25.sbatch
-```
+showing `--` for what it never produced.
 
 `sbatch/run25.sh` is the alternative for a cluster where a job may not submit
 jobs: it pre-submits a fixed chain from the login node, and therefore has to

@@ -1,98 +1,102 @@
 #!/bin/bash
 # =============================================================================
-# ONE submission that carries all three datasets to 25 epochs, evaluates them
-# and writes the report -- under a hard 4 h wall-clock cap.
+# One self-chaining job that carries ONE dataset to 25 epochs, evaluates it in
+# the same job the moment training finishes, and -- once the other datasets
+# have finished too -- builds the report.
 #
-#     sbatch sbatch/run_all25.sbatch
+#     bash sbatch/start25.sh                    # all three, one job each
+#     sbatch sbatch/run_all25.sbatch cifar10    # or just this one
 #
-# That is the whole command. It expands into a job array of three tasks (one
-# per dataset, running in parallel), and each task keeps re-submitting itself
-# until its dataset is finished:
+# THREE JOBS, NOT A JOB ARRAY
+#   start25.sh submits one ordinary job per dataset, so squeue shows three
+#   named lines you can tell apart at a glance:
 #
-#   task 0  cifar10      encode -> reference -> train (25 ep) -> evaluate --.
-#   task 1  imagenet-lt  encode -> reference -> train (25 ep) -> evaluate --+-> report
-#   task 2  imagenet     encode -> reference -> train (25 ep) -> evaluate --'
+#     JOBID     NAME             ST  TIME
+#     4812345   gfm-c10-trn      R   1:12:03
+#     4812346   gfm-inlt-trn     R   1:11:58
+#     4812347   gfm-in1k-enc     R   0:41:22
 #
-# WHY IT SELF-CHAINS INSTEAD OF PRE-SUBMITTING N LINKS
-#   sbatch/run25.sh submits a fixed number of links, so it has to GUESS how
-#   many 4 h slots 25 epochs will need -- 28 for ImageNet on the slowest card
-#   the constraint allows. Guess low and the run stops short; guess high and
-#   the queue carries jobs nobody needs. This script does not guess: every link
-#   works until Slurm kills it, and the next link picks up from
-#   train_state.pt. Training simply runs for as long as it needs.
+#   The suffix is the stage running right now: run_gfm.sbatch renames the job
+#   as each stage starts (enc / ref / trn / evl / rpt), so the NAME column is a
+#   live progress display. Widen it -- it defaults to 8 characters:
+#     squeue -u $USER -o '%.10i %.20j %.2t %.11M %.20E %R'
 #
-#   Each link submits its successor with --dependency=afterany BEFORE it starts
-#   any real work, so the chain survives a link that is killed at the wall
-#   clock, crashes, or is pre-empted. When a link finds nothing left to do it
+# HOW IT RUNS LONGER THAN THE CAP
+#   Every link asks for --time=03:55:00 and submits its own successor
+#   (--dependency=afterany on itself) BEFORE it starts any real work, so the
+#   chain survives a link that is killed at the wall clock, crashes or is
+#   pre-empted. The successor resumes from <run_dir>/train_state.pt: model,
+#   AdamW moments, cosine schedule, epoch and step. Nothing has to guess how
+#   many links 25 epochs will take -- when a link finds the work finished it
 #   exits in seconds without submitting anything, and the chain ends. The cost
-#   of that design is exactly one no-op job per dataset at the end.
+#   is exactly one no-op job per dataset at the end.
 #
-# THE GPU
-#   Same --constraint and --gres as sbatch/run_gfm.sbatch, i.e. the four card
-#   types this project is set up for. Nothing else needs to be passed.
+# EVALUATION
+#   Not a separate submission: the link whose training reaches 25 epochs goes
+#   straight on to evaluate, in the same job. Only if that link is nearly out
+#   of wall clock does it leave evaluation to its successor, which is already
+#   queued -- sampling 10k images cannot resume, so starting it with ten
+#   minutes left would throw the work away.
 #
-# WATCHING IT
-#   squeue -u $USER -o '%.10i %.20j %.2t %.11M %.20E %R'
-#   Each link renames itself to gfm-<dataset>-<phase> while a stage runs, so
-#   the NAME column says which dataset is in which stage right now.
-#   tail -f sbatch/logs/gfm25_*_*.out
+# THE REPORT
+#   The last dataset to finish runs `all report`, which scans WORK_DIR and
+#   rebuilds every figure and table from whatever is there, including the
+#   Train (h) / Infer (min) columns. GFM_DATASETS says which datasets to wait
+#   for; start25.sh sets it to the ones it launched.
 #
-# WHERE THE STATE LIVES
-#   $WORK_DIR/.gfm25/ -- one small text file per dataset: how many links have
-#   run, what the last link achieved, and a stamp per finished stage. Delete
-#   that directory to make the next submission re-check everything from
-#   scratch (it re-checks the artefacts either way; the stamps only make the
-#   check cheaper and the log clearer).
+# WATCHING / STOPPING
+#   tail -f sbatch/logs/gfm-c10_*.out
+#   touch $WORK_DIR/.gfm25/stop     # every link checks this and stops chaining
+#   scancel <jobid>                 # cancels ONE link; its successor still runs
+#                                   # (cancel that too, or use the stop file)
 #
-# STOPPING IT
-#   scancel -u $USER --name=gfm25          # and any renamed links:
-#   scancel -u $USER --name=gfm-c10-trn    # ... etc
-#   Cancelling one link does NOT stop the chain: its successor is already
-#   queued and will start the next stage. To stop for good, cancel twice, or
-#   `touch $WORK_DIR/.gfm25/stop` -- every link checks for that file and exits
-#   without submitting a successor.
+# STATE
+#   $WORK_DIR/.gfm25/ holds one small text file per dataset: link count, the
+#   signature of what the last link achieved, a stamp per finished stage.
+#   Deleting it changes nothing about what gets re-run -- the stages are
+#   decided from the artefacts themselves -- it only resets the counters.
 #
-# ENVIRONMENT (all optional, and all inherited by every later link)
+# ENVIRONMENT (optional; inherited by every later link)
 #   EPOCHS=25                  epochs per dataset
 #   GFM_DATASETS="cifar10 imagenet-lt imagenet"
-#                              which datasets, in array-index order. Submit a
-#                              subset with e.g.
-#                                GFM_DATASETS=cifar10 sbatch --array=0 \
-#                                    sbatch/run_all25.sbatch
+#                              which datasets the report waits for
 #   GFM_SBATCH_EXTRA="--exclude=bad-node-01"
 #                              extra sbatch options for every self-submission
 #   GFM_MAX_LINKS=60           give up after this many links for one dataset
-#   GFM_MAX_STALLS=3           give up after this many links in a row that made
-#                              no measurable progress (a crash loop)
+#   GFM_MAX_STALLS=3           give up after this many links in a row that
+#                              achieved nothing (a crash loop)
 #   WORK_DIR, DATA_ROOT_IMAGENET, BATCH_SIZE, MICRO_BATCH, ... as documented in
 #   sbatch/run_gfm.sbatch; this script only sets EPOCHS and forwards the rest.
 #
-# WHAT IT DOES NOT DO
-#   encode cannot resume -- it writes latent shards and only then the
-#   metadata.json that marks them usable -- so a timed-out encode restarts from
-#   the beginning. ImageNet encode is 2-4 h at 8 workers, hence the 16 CPUs
-#   below, and it is started only when a link has >40 min of wall clock left.
-#   If it still cannot finish inside one slot, run that one stage without a
-#   cap: bash sbatch/run_gfm.sbatch imagenet encode
+# THE ONE STAGE THAT CANNOT BE CHAINED
+#   encode has no resume -- it writes latent shards and only then the
+#   metadata.json that marks them usable -- so a timed-out encode starts over.
+#   It is therefore only started when a link has more than 40 minutes left.
+#   ImageNet encode is 2-4 h at 8 workers; if it cannot fit one slot, run that
+#   single stage once without a cap and everything after it chains normally:
+#     sbatch --time=08:00:00 --cpus-per-task=32 sbatch/run_gfm.sbatch imagenet encode
 # =============================================================================
 #SBATCH --job-name=gfm25
-#SBATCH --output=sbatch/logs/%x_%A_%a.out
-#SBATCH --error=sbatch/logs/%x_%A_%a.err
+#SBATCH --output=sbatch/logs/%x_%j.out
+#SBATCH --error=sbatch/logs/%x_%j.err
 #SBATCH --time=03:55:00
-#SBATCH --array=0-2
-#SBATCH --cpus-per-task=16
+#SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
 #SBATCH --partition=gpu
 #SBATCH --gres=gpu:1
 #SBATCH --constraint=rtx_3090|rtx_4090|rtx_6000|rtx_pro_6000
+
+# Deliberately the same cpus / mem / partition / constraint as run_gfm.sbatch:
+# those are the values already known to get scheduled on this cluster. Asking
+# for more cores than a stage needs only makes the job wait longer for a slot.
 
 # NOT set -e: a stage that fails must still reach the bookkeeping at the end of
 # this script, which is what decides whether the chain continues and why.
 set -uo pipefail
 
 # Slurm may run this script from a spool copy, so $0 is not the repo. The
-# submission directory is, and it is carried forward explicitly so that later
-# links do not depend on where they were submitted from.
+# submission directory is, and it is carried forward explicitly so later links
+# do not depend on where they were submitted from.
 REPO="${GFM_REPO:-${SLURM_SUBMIT_DIR:-$PWD}}"
 cd "$REPO" || { echo "ERROR: cannot cd to $REPO" >&2; exit 1; }
 if [ ! -f train.py ] || [ ! -f sbatch/run_gfm.sbatch ]; then
@@ -103,25 +107,42 @@ fi
 export GFM_REPO="$REPO"
 mkdir -p sbatch/logs
 
+DATASET="${1:-${GFM_DATASET:-cifar10}}"
+case "$DATASET" in
+    cifar10|imagenet|imagenet-lt) ;;
+    *) echo "ERROR: unknown dataset '$DATASET' (cifar10|imagenet|imagenet-lt)" >&2
+       echo "usage: sbatch sbatch/run_all25.sbatch <dataset>" >&2
+       exit 2 ;;
+esac
+export GFM_DATASET="$DATASET"
+SLUG="${DATASET//-/_}"
+
+case "$DATASET" in
+    cifar10)     SHORT=c10 ;;
+    imagenet)    SHORT=in1k ;;
+    imagenet-lt) SHORT=inlt ;;
+esac
+JOB_NAME="gfm-${SHORT}"
+
 export EPOCHS="${EPOCHS:-25}"
 GFM_MAX_LINKS="${GFM_MAX_LINKS:-60}"
 GFM_MAX_STALLS="${GFM_MAX_STALLS:-3}"
 # shellcheck disable=SC2206  # word splitting is the point: these are options
 SBATCH_EXTRA=(${GFM_SBATCH_EXTRA:-})
+read -r -a REPORT_DATASETS <<< "${GFM_DATASETS:-cifar10 imagenet-lt imagenet}"
 
-# Which dataset is this task? The list is also what the report waits for.
-read -r -a DATASETS <<< "${GFM_DATASETS:-cifar10 imagenet-lt imagenet}"
-IDX="${SLURM_ARRAY_TASK_ID:-0}"
-if [ "$IDX" -ge "${#DATASETS[@]}" ]; then
-    echo "array index ${IDX} is beyond GFM_DATASETS (${DATASETS[*]}) -- nothing to do"
-    exit 0
+# Name the job after its dataset straight away, so squeue is readable while the
+# link is still setting up. run_gfm.sbatch narrows it to gfm-<short>-<phase> as
+# each stage starts, which is where the live progress display comes from; that
+# rename only fires for names matching gfm-*, which this one does by
+# construction.
+if [ -n "${SLURM_JOB_ID:-}" ] && command -v scontrol >/dev/null 2>&1; then
+    scontrol update "JobId=$SLURM_JOB_ID" "Name=$JOB_NAME" 2>/dev/null || true
 fi
-DATASET="${DATASETS[$IDX]}"
-SLUG="${DATASET//-/_}"
 
-# WORK_DIR is resolved the same way run_gfm.sbatch resolves it, and for the
-# same reason: site.env is where a cluster puts its scratch path. Only the
-# value is needed here -- everything else in that file is for the stage jobs.
+# WORK_DIR is resolved the way run_gfm.sbatch resolves it, and for the same
+# reason: site.env is where a cluster puts its scratch path. Only that value is
+# needed here; everything else in the file is for the stage jobs.
 if [ -f sbatch/site.env ]; then
     set -a
     # shellcheck disable=SC1091
@@ -143,10 +164,10 @@ log() { echo "[gfm25 ${DATASET} link ${LINK:-?}] $*"; }
 # --------------------------------------------------------------------------- #
 #  How much of this allocation is left?
 #
-#  Every decision to start a stage is really "will it get anywhere before
-#  Slurm kills me". squeue knows; if it does not answer (no Slurm on the node,
-#  an unparsable format) the safe assumption is "plenty", because starting a
-#  stage too late merely repeats work the next link redoes anyway.
+#  Every decision to start a stage is really "will it get anywhere before Slurm
+#  kills me". squeue knows; if it does not answer (no Slurm on the node, an
+#  unparsable format) the safe assumption is "plenty", because starting a stage
+#  too late merely repeats work the next link redoes anyway.
 # --------------------------------------------------------------------------- #
 time_left_s() {
     local raw d h m s
@@ -173,8 +194,8 @@ fmt_left() { printf '%dh%02dm' $(( $1 / 3600 )) $(( ($1 % 3600) / 60 )); }
 #  What is already done?
 #
 #  Answered from the artefacts, not from bookkeeping: a dataset encoded last
-#  month, or trained by sbatch/run25.sh, must not be redone just because this
-#  script has no stamp for it.
+#  month, or trained by an earlier attempt, must not be redone just because
+#  this script has no stamp for it.
 # --------------------------------------------------------------------------- #
 have_latents() {
     compgen -G "$WORK_DIR/encoded/${SLUG}_*/metadata.json" >/dev/null 2>&1
@@ -186,8 +207,8 @@ have_reference() {
 }
 
 # Last epoch number in the training log. log_epoch() is called with epoch + 1,
-# so this is a count of finished epochs, and it survives the resume because the
-# CSV is appended to rather than rewritten.
+# so this counts finished epochs, and it survives a resume because the CSV is
+# appended to rather than rewritten.
 epochs_done() {
     local last
     [ -s "$EPOCH_CSV" ] || { echo 0; return 0; }
@@ -202,10 +223,10 @@ gave_up()       { [ -f "$STATE_DIR/${SLUG}.gaveup" ]; }
 dataset_done() { { eval_done && training_done; } || gave_up; }
 
 # --------------------------------------------------------------------------- #
-#  Did the previous link achieve anything?
+#  Did this link achieve anything?
 #
-#  An ImageNet epoch is ~3.6 h on a 3090, so a 3h55 link can easily finish ZERO
-#  epochs and still have done four hours of useful work. Progress is therefore
+#  An ImageNet epoch is ~3.6 h on a 3090, so a 3h55 link can finish ZERO epochs
+#  and still have done four hours of useful work. Progress is therefore
 #  measured on the step counter and the resume file, never on epochs alone --
 #  otherwise a healthy long run would look like a crash loop.
 # --------------------------------------------------------------------------- #
@@ -221,12 +242,12 @@ progress_signature() {
 }
 
 # --------------------------------------------------------------------------- #
-#  Run one stage of the pipeline.
+#  Run one stage.
 #
 #  run_gfm.sbatch is the single place that knows about venv activation, the
 #  ImageNet root, micro-batch sizing and the CUDA preflight, so stages go
 #  through it rather than calling run_pipeline.py directly. It also renames the
-#  running job to gfm-<dataset>-<phase>, which is what makes squeue readable
+#  running job to gfm-<short>-<phase>, which is what makes squeue readable
 #  while a chain is in flight.
 # --------------------------------------------------------------------------- #
 run_stage() {
@@ -245,20 +266,20 @@ run_stage() {
 }
 
 # --------------------------------------------------------------------------- #
-#  Bookkeeping: link number, stall counter
+#  Bookkeeping
 # --------------------------------------------------------------------------- #
 LINK=$(( $(cat "$STATE_DIR/${SLUG}.links" 2>/dev/null || echo 0) + 1 ))
 echo "$LINK" > "$STATE_DIR/${SLUG}.links"
-# The state the PREVIOUS link left behind, and how many links in a row have
-# left it untouched. Both are only compared once this link has done its work,
-# at the bottom of the script -- comparing them here would compare the previous
-# link's end state with itself.
+# What the PREVIOUS link left behind, and how many links in a row have left it
+# untouched. Compared only at the bottom of this script, once this link has
+# done its work: comparing here would compare the previous link's end state
+# with itself.
 PREV_SIG="$(cat "$STATE_DIR/${SLUG}.sig" 2>/dev/null || echo none)"
 STALLS="$(cat "$STATE_DIR/${SLUG}.stalls" 2>/dev/null || echo 0)"
 
 echo "=================================================="
 echo " gfm25  dataset=${DATASET}  link=${LINK}  epochs=${EPOCHS}"
-echo " host=$(hostname)  job=${SLURM_JOB_ID:-none}  array=${SLURM_ARRAY_JOB_ID:-none}[${IDX}]"
+echo " job=${SLURM_JOB_ID:-none} (${JOB_NAME})  host=$(hostname)"
 echo " work_dir=${WORK_DIR}"
 echo " time limit=$(fmt_left "$(time_left_s)")"
 echo " state: latents=$(have_latents && echo yes || echo no)"                 \
@@ -297,16 +318,16 @@ submit_successor() {
     if [ "$STALLS" -ge "$GFM_MAX_STALLS" ]; then
         log "ERROR: ${STALLS} links in a row made no progress -- this is a crash"
         log "       loop, not slow training. Not submitting another link."
-        log "       Read sbatch/logs/gfm25_*_${IDX}.err, fix, then resubmit:"
-        log "         rm ${STATE_DIR}/${SLUG}.stalls"
-        log "         sbatch --array=${IDX} sbatch/run_all25.sbatch"
+        log "       Read sbatch/logs/${JOB_NAME}_*.err, fix, then restart with:"
+        log "         rm ${STATE_DIR}/${SLUG}.stalls ${STATE_DIR}/${SLUG}.gaveup"
+        log "         sbatch sbatch/run_all25.sbatch ${DATASET}"
         : > "$STATE_DIR/${SLUG}.gaveup"
         return 1
     fi
-    out="$(sbatch --array="${IDX}" \
+    out="$(sbatch --job-name="$JOB_NAME" \
                   --dependency="afterany:${SLURM_JOB_ID}" \
                   ${SBATCH_EXTRA[@]+"${SBATCH_EXTRA[@]}"} \
-                  sbatch/run_all25.sbatch 2>&1)" || {
+                  sbatch/run_all25.sbatch "$DATASET" 2>&1)" || {
         log "ERROR: could not submit the next link:"
         printf '%s\n' "$out" >&2
         return 1
@@ -322,29 +343,29 @@ else
 fi
 
 # --------------------------------------------------------------------------- #
-#  The stages. Each one is skipped if it is already done, or if too little of
+#  The stages. Each is skipped when it is already done, or when too little of
 #  the allocation is left for it to get anywhere; the successor picks it up.
 # --------------------------------------------------------------------------- #
-MIN_STAGE_S=2400        # 40 min: encode / reference / evaluate
+MIN_STAGE_S=2400        # 40 min: encode / reference, neither of which resumes
 MIN_TRAIN_S=1200        # 20 min: below this a train link mostly repeats itself
+MIN_EVAL_S=1800         # 30 min: sampling cannot resume either
 
-# Weights are shared by all three tasks, so exactly one of them may download
-# them. flock makes the other two wait rather than race on the same HF_HOME.
+# The weights are shared by all three datasets, so the download must happen
+# once. flock makes concurrent dataset jobs wait rather than race on the same
+# HF_HOME.
 if [ ! -f "$STATE_DIR/warmup.ok" ]; then
-    if command -v flock >/dev/null 2>&1; then
-        (
-            flock 9
-            if [ ! -f "$STATE_DIR/warmup.ok" ]; then
-                log "caching pretrained weights (once, shared by all datasets)"
-                # A compute node without outbound network cannot do this, and
-                # that is not fatal here: it only means the weights must
-                # already be cached, and the encode stage says so if they are
-                # not. Do not stamp it as done in that case.
-                bash sbatch/run_gfm.sbatch cifar10 warmup && : > "$STATE_DIR/warmup.ok"
-            fi
-        ) 9> "$STATE_DIR/warmup.lock"
-    else
+    warmup() {
+        [ -f "$STATE_DIR/warmup.ok" ] && return 0
+        log "caching pretrained weights (once, shared by all datasets)"
+        # A compute node with no outbound network cannot do this, and that is
+        # not fatal here: it only means the weights must already be cached, and
+        # encode says so loudly if they are not. Do not stamp it done then.
         bash sbatch/run_gfm.sbatch cifar10 warmup && : > "$STATE_DIR/warmup.ok"
+    }
+    if command -v flock >/dev/null 2>&1; then
+        ( flock 9; warmup ) 9> "$STATE_DIR/warmup.lock"
+    else
+        warmup
     fi
 fi
 
@@ -371,28 +392,31 @@ if have_latents && ! training_done; then
         log "  mostly repeat the current epoch after the resume"
     else
         # Expected to be killed at the wall clock. train.py writes
-        # train_state.pt every --state_every_steps and at every epoch
-        # boundary, and --resume auto (the default) continues from it.
+        # train_state.pt every --state_every_steps and at every epoch boundary,
+        # and --resume auto (the default) continues from it.
         run_stage train || true
-        log "after this link: $(epochs_done)/${EPOCHS} epochs"
+        if training_done; then
+            log "training complete: $(epochs_done)/${EPOCHS} epochs"
+        else
+            log "after this link: $(epochs_done)/${EPOCHS} epochs"
+        fi
     fi
 fi
 
+# Straight on to evaluation in this same job, which is the usual case: training
+# has just finished and there is wall clock left.
 if training_done && ! eval_done; then
-    if [ "$(time_left_s)" -lt "$MIN_STAGE_S" ]; then
-        log "training complete; leaving evaluate to the next link"
+    if [ "$(time_left_s)" -lt "$MIN_EVAL_S" ]; then
+        log "training is complete, but only $(fmt_left "$(time_left_s)") is left"
+        log "  and sampling cannot resume -- the next link (already queued)"
+        log "  evaluates with a full slot"
     else
         run_stage evaluate || true
     fi
 fi
 
 # --------------------------------------------------------------------------- #
-#  Report -- once, when every dataset has finished (or given up).
-#
-#  build_paper.py and plot_training_curves.py write one global figure set and
-#  one set of tables, so two of them running at once would overwrite each
-#  other's rows. flock serialises them; the stamp keeps a finished report from
-#  being rebuilt by a link that has nothing else to do.
+#  Progress accounting for the next link
 # --------------------------------------------------------------------------- #
 END_SIG="$(progress_signature)"
 if dataset_done; then
@@ -421,20 +445,28 @@ if dataset_done; then
     fi
 fi
 
+# --------------------------------------------------------------------------- #
+#  Report -- once, when every dataset has finished (or given up).
+#
+#  build_paper.py and plot_training_curves.py write one global figure set and
+#  one set of tables, so two of them at once would overwrite each other's rows.
+#  flock serialises the three dataset jobs; the stamp keeps a finished report
+#  from being rebuilt by a link that has nothing else to do.
+# --------------------------------------------------------------------------- #
 all_done=1
-for d in "${DATASETS[@]}"; do
+for d in "${REPORT_DATASETS[@]}"; do
     [ -f "$STATE_DIR/done_${d//-/_}" ] || all_done=0
 done
 
 if [ "$all_done" -eq 1 ]; then
     report() {
-        local stamp="$STATE_DIR/report.ok" newer=0
+        local stamp="$STATE_DIR/report.ok" newer=0 d j
         # Never built before -> build it, even if not one dataset produced
         # metrics: the tables render '--' for whatever is missing, and a run
         # that ended badly is exactly when the summary is worth having.
         [ -f "$stamp" ] || newer=1
-        for d in "${DATASETS[@]}"; do
-            local j="$WORK_DIR/results/${d//-/_}/metrics.json"
+        for d in "${REPORT_DATASETS[@]}"; do
+            j="$WORK_DIR/results/${d//-/_}/metrics.json"
             [ -s "$j" ] || continue
             if [ ! -f "$stamp" ] || [ "$j" -nt "$stamp" ]; then newer=1; fi
         done
@@ -442,7 +474,7 @@ if [ "$all_done" -eq 1 ]; then
             log "report is already up to date"
             return 0
         fi
-        log "all datasets finished -- building the report"
+        log "every dataset has finished -- building the report"
         if bash sbatch/run_gfm.sbatch all report; then
             : > "$stamp"
             log "report written: paper/generated/*.tex, paper/figures/*"
@@ -460,7 +492,7 @@ if [ "$all_done" -eq 1 ]; then
     fi
 else
     still=()
-    for d in "${DATASETS[@]}"; do
+    for d in "${REPORT_DATASETS[@]}"; do
         [ -f "$STATE_DIR/done_${d//-/_}" ] || still+=("$d")
     done
     log "still running: ${still[*]} -- the last one to finish builds the report"
