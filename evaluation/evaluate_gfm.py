@@ -134,9 +134,11 @@ def load_decoder(args):
 def sample_images(args, vel_net, decoder, out_dir):
     """Integrate the learned velocity field and write PNGs at eval resolution.
 
-    Returns (out_dir, elapsed_seconds). That elapsed time IS the inference
-    cost of the run -- ODE integration, VAE decode and PNG write -- and is
-    what metrics.json and the report tables report.
+    Returns (out_dir, elapsed_seconds, nfe_per_image). That elapsed time IS
+    the inference cost of the run -- ODE integration, VAE decode and PNG
+    write -- and is what metrics.json and the report tables report. nfe is
+    the measured number of velocity-field evaluations per image, which is
+    args.nsteps multiplied by the solver's stage count.
     """
     from utils.utils import integrate_ode
 
@@ -145,16 +147,22 @@ def sample_images(args, vel_net, decoder, out_dir):
     np.random.seed(args.seed)
 
     dt = 1.0 / args.nsteps
+    nfe = None
     written = 0
     t0 = time.time()
     while written < args.num_samples:
         bs = min(args.batch_size, args.num_samples - written)
         z0 = torch.randn(bs, args.latent_channels, args.latent_size,
                          args.latent_size, device=args.device)
-        z_final, _ = integrate_ode(
+        z_final, model_calls = integrate_ode(
             vel_net, z0, dt, args.nsteps, method=args.int_method,
             base_model=args.base_model, traj=False,
             time_convention=args.time_convention)
+        # NFE is velocity evaluations, not solver steps: rk4 calls the model
+        # four times per step, rk2 twice, euler once (utils/utils.py). The
+        # count is per batch and identical for every batch, so the last one
+        # stands for the run.
+        nfe = int(model_calls)
         del z0
 
         x = decoder(z_final)                     # [-1, 1], [B, 3, H, W]
@@ -179,8 +187,8 @@ def sample_images(args, vel_net, decoder, out_dir):
     elapsed = time.time() - t0
     print(f"[sample] {written} images in {_fmt_hms(elapsed)}  "
           f"({1000.0 * elapsed / max(written, 1):.1f} ms/img at "
-          f"{args.nsteps} NFE)")
-    return out_dir, elapsed
+          f"{nfe} NFE / {args.nsteps} {args.int_method} steps)")
+    return out_dir, elapsed, nfe
 
 
 def save_sample_grid(sample_dir, out_path, rows=8, cols=8):
@@ -221,6 +229,7 @@ def main(argv=None):
     # None, not 0.0, when the samples are reused: that cost was paid by an
     # earlier job, and a zero here would read as 'sampling was free'.
     sampling_s = None
+    nfe_measured = None
     have = len(M.list_images(args.sample_dir)) if os.path.isdir(args.sample_dir) else 0
     if args.reuse_samples and have >= args.num_samples:
         print(f"[sample] reusing {have} existing images in {args.sample_dir}")
@@ -235,7 +244,8 @@ def main(argv=None):
         print(f"[model] {n_params/1e6:.2f}M parameters")
         decoder = load_decoder(args)
         decoder.eval()
-        _, sampling_s = sample_images(args, vel_net, decoder, args.sample_dir)
+        _, sampling_s, nfe_measured = sample_images(
+            args, vel_net, decoder, args.sample_dir)
         del vel_net, decoder
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -261,12 +271,18 @@ def main(argv=None):
 
     # metrics_s and total_s are filled in at the very end, once the metric
     # phase has run; the dict is in results already, so it is one object.
+    # Reused samples were integrated by an earlier run, so the count cannot be
+    # measured here; fall back to the solver's stage count, which is what the
+    # earlier run would have done.
+    _STAGES = {"rk4": 4, "rk2": 2, "euler": 1}
     timing = {
         "sampling_s": sampling_s,
         "samples_reused": sampling_s is None,
         "ms_per_image": (None if sampling_s is None else
                          1000.0 * sampling_s / max(args.num_samples, 1)),
-        "nfe_per_image": args.nsteps,
+        "nfe_per_image": (nfe_measured if nfe_measured is not None else
+                          args.nsteps * _STAGES.get(args.int_method, 1)),
+        "solver_steps": args.nsteps,
     }
     results["timing"] = timing
 

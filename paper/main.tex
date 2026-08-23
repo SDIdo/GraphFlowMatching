@@ -496,8 +496,26 @@ by the real set's statistics and is therefore on a comparable scale across rows.
   over the whole run even where it was split across chained jobs and excluding
   the time those jobs spent queued; ``Infer'' is the time to sample the
   $N_{\text{gen}}$ images at the solver step count of \cref{tab:config}, with
-  metric computation excluded.}
+  metric computation excluded. ``NFE'' is the number of velocity-field
+  evaluations per image, reported as in \citet{lipman2023flow} so that sampling
+  cost can be compared independently of hardware; \cref{tab:timing} breaks the
+  same cost down in seconds.}
   \label{tab:results}
+\end{table}
+
+\begin{table}[t]
+  \centering
+  \small
+  \safeinput{generated/timing_table.tex}
+  \caption{Wall-clock cost of each run, separated into the three phases that
+  consume it. ``Train'' is cumulative single-GPU time over the whole run,
+  including chained jobs and excluding queue time. ``Sample'' is ODE
+  integration, VAE decode and PNG write for the $N_{\text{gen}}$ images;
+  ``ms/img'' is that time per image, and ``Metrics'' is the disjoint cost of
+  computing FID/IS/KID/MMD and the $t$-SNE embedding over images already on
+  disk. NFE is repeated here because it, not the clock, is what transfers
+  across hardware.}
+  \label{tab:timing}
 \end{table}
 
 \begin{table}[t]
