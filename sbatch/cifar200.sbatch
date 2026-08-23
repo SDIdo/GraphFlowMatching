@@ -80,6 +80,12 @@
 #   tail -f sbatch/logs/c200_*.out
 #   squeue shows these as c200; run_all25 cifar10 links are gfm-c10-*.
 #   touch $WORK_DIR/.cifar200/stop     # stop chaining after the current link
+#
+# ONE CHAIN ONLY
+#   Submit this script once. Each submission starts an independent chain, and
+#   two chains write the same run directory and corrupt it. A link that finds
+#   another one already running backs off instead (see the lock below), but the
+#   wasted queue slots are yours either way.
 # =============================================================================
 # NOT gfm-*: run_gfm.sbatch renames any job called gfm, run_gfm.sbatch or
 # gfm-* to gfm-<dataset>-<phase>, and <dataset> comes from the dataset rather
@@ -214,6 +220,41 @@ echo " state: latents=$(have_latents && echo yes || echo no)" \
      "epochs=$(epochs_done)/${EPOCHS}" \
      "evaluated=$(eval_done && echo yes || echo no)"
 echo "=================================================="
+
+# --------------------------------------------------------------------------- #
+#  Single-writer lock.
+#
+#  Every link of this chain writes the same run directory. Two links training
+#  it at once interleave their appends to train_log_epochs.csv, race on
+#  train_state.pt, and each resumes from the other's weights with optimizer
+#  moments from a different trajectory -- the model thrashes and never
+#  converges. That is not hypothetical: it is what happens when
+#  `sbatch sbatch/cifar200.sbatch` is run more than once, because each
+#  submission starts an independent chain against the same directory.
+#
+#  A queued successor is fine and expected -- it cannot start until this job
+#  ends (afterany). What must never happen is two links RUNNING at once, so
+#  that is exactly what is checked. A stale id from a job that has since died
+#  is ignored, and no successor is submitted by the link that backs off.
+# --------------------------------------------------------------------------- #
+LOCK="$STATE_DIR/running"
+OTHER="$(cat "$LOCK" 2>/dev/null || true)"
+if [ -n "$OTHER" ] && [ "$OTHER" != "${SLURM_JOB_ID:-}" ]; then
+    if squeue -h -j "$OTHER" -o '%t' 2>/dev/null | tr -d ' ' | grep -qx 'R'; then
+        log "another link of this chain (job ${OTHER}) is already RUNNING."
+        log "  Two links sharing ${RUN_DIR} would corrupt it, so this one is"
+        log "  backing off without doing anything and without chaining."
+        log "  This happens when cifar200.sbatch is submitted more than once;"
+        log "  one chain is all you need. To see the chains:"
+        log "    squeue -u \$USER -n c200"
+        exit 0
+    fi
+    log "note: stale lock from job ${OTHER} (no longer running) -- taking over"
+fi
+echo "${SLURM_JOB_ID:-$$}" > "$LOCK"
+# Release it on the way out however this link ends, so the successor is never
+# blocked by its own predecessor.
+trap 'if [ "$(cat "$LOCK" 2>/dev/null)" = "${SLURM_JOB_ID:-$$}" ]; then rm -f "$LOCK"; fi' EXIT
 
 # --------------------------------------------------------------------------- #
 #  Submit the successor FIRST, so the chain survives this link being killed.
