@@ -77,10 +77,17 @@
 #   WORK_DIR, BATCH_SIZE, MICRO_BATCH, ... as in sbatch/run_gfm.sbatch
 #
 # WATCHING / STOPPING
-#   tail -f sbatch/logs/gfm-c200_*.out
+#   tail -f sbatch/logs/c200_*.out
+#   squeue shows these as c200; run_all25 cifar10 links are gfm-c10-*.
 #   touch $WORK_DIR/.cifar200/stop     # stop chaining after the current link
 # =============================================================================
-#SBATCH --job-name=gfm-c200
+# NOT gfm-*: run_gfm.sbatch renames any job called gfm, run_gfm.sbatch or
+# gfm-* to gfm-<dataset>-<phase>, and <dataset> comes from the dataset rather
+# than from this chain -- so a gfm-c200 job shows up in squeue as gfm-c10-trn,
+# identical to a run_all25 cifar10 link. Then you cannot tell the two chains
+# apart and cancelling the right one becomes guesswork. A name outside that
+# pattern is kept as-is ("keeping explicit job name").
+#SBATCH --job-name=c200
 #SBATCH --output=sbatch/logs/%x_%j.out
 #SBATCH --error=sbatch/logs/%x_%j.err
 #SBATCH --time=03:55:00
@@ -227,7 +234,7 @@ submit_successor() {
         return 1
     fi
     tl="$(job_time_limit)"
-    out="$(sbatch --job-name=gfm-c200 \
+    out="$(sbatch --job-name=c200 \
                   ${tl:+--time="$tl"} \
                   --dependency="afterany:${SLURM_JOB_ID}" \
                   ${GFM_SBATCH_EXTRA:+$GFM_SBATCH_EXTRA} \
