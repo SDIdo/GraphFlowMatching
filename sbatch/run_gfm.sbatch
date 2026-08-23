@@ -93,7 +93,11 @@
 # Overridable via the environment:
 #   DATA_ROOT_CIFAR10, DATA_ROOT_IMAGENET, WORK_DIR, HF_HOME, TORCH_HOME,
 #   BATCH_SIZE, MICRO_BATCH, EPOCHS, EVAL_SAMPLES, REF_IMAGES, GFM_VARIANTS,
-#   IMAGENET_LT_SPLIT, GFM_CACHE_DIR, GFM_ALLOW_PARETO
+#   IMAGENET_LT_SPLIT, GFM_CACHE_DIR, GFM_ALLOW_PARETO, NSTEPS
+#
+#   NSTEPS is the ODE step count the evaluate stage integrates with (NFE
+#   per image). It exists as an environment knob because run_all25.sbatch
+#   runs evaluate itself, with no place to pass a flag through.
 #
 # -----------------------------------------------------------------------------
 # GPU MEMORY -- why BATCH_SIZE is not what has to fit.
@@ -483,6 +487,7 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
 
 EPOCHS="${EPOCHS:-200}"
 EVAL_SAMPLES="${EVAL_SAMPLES:-10000}"
+NSTEPS="${NSTEPS:-3}"
 REF_IMAGES="${REF_IMAGES:-50000}"
 NUM_WORKERS="${SLURM_CPUS_PER_TASK:-8}"
 
@@ -506,7 +511,7 @@ echo " host=$(hostname)  job=${SLURM_JOB_ID:-none}"
 echo " dataset=${DATASET}  phase=${PHASE}  extra_args=$*"
 echo " data_root=${DATA_ROOT}"
 echo " work_dir=${WORK_DIR}"
-echo " workers=${NUM_WORKERS}  epochs=${EPOCHS}"
+echo " workers=${NUM_WORKERS}  epochs=${EPOCHS}  nsteps=${NSTEPS}"
 echo " batch=${BATCH_SIZE} (micro ${MICRO_BATCH} x accum ${GRAD_ACCUM})"
 echo " gpu=${GPU_INFO:-none}"
 echo "=================================================="
@@ -587,6 +592,7 @@ COMMON=(
     --flow_epochs "$EPOCHS"
     --num_eval_samples "$EVAL_SAMPLES"
     --num_reference_images "$REF_IMAGES"
+    --nsteps "$NSTEPS"
 )
 
 # --- EXECUTION ---
