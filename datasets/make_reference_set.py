@@ -53,6 +53,9 @@ def parse_args(argv=None):
     p.add_argument("--split", default="train", choices=["train", "val", "test"])
     p.add_argument("--imagenet_subdir", default="train")
     p.add_argument("--imagenet_lt_split_file", default=None)
+    p.add_argument("--no_pareto_fallback", action="store_true",
+                   help="Fail instead of reconstructing an LT split")
+    p.add_argument("--pareto_seed", type=int, default=0)
 
     p.add_argument("--source_image_size", type=int, default=256,
                    help="Resolution the model was trained at (must match the "
@@ -120,6 +123,8 @@ def main(argv=None):
         return_label=True,
         imagenet_subdir=args.imagenet_subdir,
         split_file=args.imagenet_lt_split_file,
+        allow_pareto_fallback=not args.no_pareto_fallback,
+        pareto_seed=args.pareto_seed,
     )
     print(f"[data] {args.dataset}/{args.split}: {len(ds)} images available")
 

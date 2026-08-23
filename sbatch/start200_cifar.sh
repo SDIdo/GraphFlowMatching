@@ -38,7 +38,30 @@
 # =============================================================================
 set -uo pipefail
 
-cd "$(dirname "$0")/.."
+# This is a launcher, not a batch script: it has no #SBATCH headers and its
+# whole job is to submit the chain and exit. Run it with bash on a login node.
+#
+# It still has to survive `sbatch sbatch/start200_cifar.sh`, because that is
+# the natural thing to type in a directory full of sbatch scripts. Under sbatch
+# the script runs from a spool copy, so $0 is NOT in the repo and dirname $0
+# would cd somewhere else entirely; SLURM_SUBMIT_DIR is the repo, and is used
+# the same way run_all25.sbatch uses it.
+if [ -n "${SLURM_JOB_ID:-}" ]; then
+    cd "${GFM_REPO:-${SLURM_SUBMIT_DIR:-$PWD}}" || exit 1
+    echo "NOTE: this was submitted with sbatch. It works, but it is a launcher:"
+    echo "      it burns a queue slot to spend one second calling sbatch again."
+    echo "      Next time just run it on the login node:"
+    echo "          bash sbatch/start200_cifar.sh"
+    echo
+else
+    cd "$(dirname "$0")/.." || exit 1
+fi
+
+if [ ! -f train.py ] || [ ! -f sbatch/start25.sh ]; then
+    echo "ERROR: $PWD is not the GraphFlowMatching repo (no train.py)." >&2
+    echo "       Run this from the repo root, or set GFM_REPO=/path/to/repo." >&2
+    exit 1
+fi
 
 DRY_RUN=0
 SCRATCH=0
